@@ -6,6 +6,7 @@ import type {
   MessageType,
   PermissionRecord,
   PermissionStatus,
+  ProjectRecord,
   PushSubscriptionRecord,
   SessionRecord,
   SessionStatus,
@@ -14,6 +15,10 @@ import type {
 const db = new Database(config.dbPath);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
+// watch-project.ts opens this same file from a separate short-lived process
+// while the server is running; WAL handles concurrent access, but give a
+// writer a moment to retry instead of failing immediately on contention.
+db.pragma("busy_timeout = 5000");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS sessions (
@@ -63,6 +68,19 @@ db.exec(`
     resolved_at INTEGER
   );
   CREATE INDEX IF NOT EXISTS idx_permissions_status ON permissions(status);
+
+  -- Projects JARVIS is allowed to launch a fresh session into, registered by
+  -- "npm run watch-project <path>" at the moment it wires up that project's
+  -- hooks — before any session has ever run there. This is what makes
+  -- "open <project>" possible: JARVIS needs a cwd to spawn into, and until
+  -- now the only cwd's it ever knew about came from a session that had
+  -- already started manually.
+  CREATE TABLE IF NOT EXISTS projects (
+    tag TEXT PRIMARY KEY,
+    cwd TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL
+  );
 `);
 
 const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
@@ -244,6 +262,41 @@ export function hasRecentDeadPermission(sinceMs: number): boolean {
       )
       .get(Date.now() - sinceMs) !== undefined
   );
+}
+
+export function registerProject(tag: string, cwd: string): void {
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO projects (tag, cwd, created_at, last_used_at)
+     VALUES (@tag, @cwd, @now, @now)
+     ON CONFLICT(tag) DO UPDATE SET cwd = @cwd, last_used_at = @now`,
+  ).run({ tag, cwd, now });
+}
+
+export function getProject(tag: string): ProjectRecord | undefined {
+  return db.prepare(`SELECT * FROM projects WHERE tag = ?`).get(tag) as ProjectRecord | undefined;
+}
+
+export function getProjectByCwd(cwd: string): ProjectRecord | undefined {
+  return db.prepare(`SELECT * FROM projects WHERE cwd = ?`).get(cwd) as ProjectRecord | undefined;
+}
+
+export function listProjects(): ProjectRecord[] {
+  return db.prepare(`SELECT * FROM projects ORDER BY tag`).all() as ProjectRecord[];
+}
+
+// A project's launchable cwd: the registry if it's been watched, else the
+// most recent session that ever ran there (covers projects set up before
+// this feature existed, without requiring them to be re-watched).
+export function findLaunchableCwd(tag: string): string | undefined {
+  const registered = getProject(tag);
+  if (registered) return registered.cwd;
+  const row = db
+    .prepare(
+      `SELECT cwd FROM sessions WHERE project_tag = ? AND cwd IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
+    )
+    .get(tag) as { cwd: string } | undefined;
+  return row?.cwd;
 }
 
 export default db;

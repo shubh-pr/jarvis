@@ -49,6 +49,13 @@ export interface PermissionRecord {
   resolved_at: number | null;
 }
 
+export interface ProjectRecord {
+  tag: string;
+  cwd: string;
+  created_at: number;
+  last_used_at: number;
+}
+
 export interface PushSubscriptionRecord {
   id: number;
   endpoint: string;

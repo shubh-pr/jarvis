@@ -6,6 +6,8 @@ Before building the serverless architecture in §2–§10, a local prototype is 
 
 **Current shape**: a single always-running Node process on the home machine, using Claude Code's `PermissionRequest` / `Stop` / `SessionStart` hooks to observe sessions started manually in a terminal (`.claude/settings.local.json` per project, pointed at the local server). Permission requests block with no timeout until answered. The same passcode-gated PWA (WebSocket + Web Push fallback) from §3.3 is the front end, and replies are routed to the right project via `claude --resume <id> --print "<text>"`.
 
+**2026-09-23 — deliberate scope change:** the above describes hooks that observe sessions *you* start. As of this date, JARVIS can also originate a session itself: saying `open <project>` for a project you've registered with `watch-project.ts` but haven't started running launches `claude --print "<instruction>"` there directly. This is narrower than it sounds — it only ever targets a project you explicitly registered in advance, it always requires an instruction (no default prompt), and once launched the session is tracked and observed exactly like a manually-started one from that point on. It does not change anything else in §0: permission requests still hold indefinitely with no default action, and JARVIS still never resumes or acts on an existing session without your say-so.
+
 **What Phase 0 should prove out before moving to Phase 1 (serverless):**
 
 - The approval/decision-point UX is fast and unambiguous on a phone (push → open app → see exactly what's being asked → reply).

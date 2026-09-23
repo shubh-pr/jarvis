@@ -1,6 +1,14 @@
 import crypto from "node:crypto";
 import type { PermissionResult } from "@anthropic-ai/claude-agent-sdk";
-import { upsertSession, addMessage, getLastMessageContent, getSession, listSessions } from "../db.js";
+import {
+  upsertSession,
+  addMessage,
+  getLastMessageContent,
+  getSession,
+  listSessions,
+  listProjects,
+  getProjectByCwd,
+} from "../db.js";
 import { registerPendingPermission, cancelPermission } from "../agent/permissions.js";
 import { notify } from "../notifier.js";
 import { deriveProjectTag } from "./projectTag.js";
@@ -11,7 +19,17 @@ import { readLastAssistantText } from "./transcript.js";
 function resolveProjectTag(sessionId: string, cwd: string): string {
   const existing = getSession(sessionId);
   if (existing) return existing.project_tag;
-  return deriveProjectTag(cwd, listSessions());
+  // A registered project's tag wins for its own directory — it may have been
+  // disambiguated at registration (e.g. "payments-api" for a folder named
+  // "api"), and a session there must carry that same tag or "open" wouldn't
+  // recognise it as already running.
+  const registered = getProjectByCwd(cwd);
+  if (registered) return registered.tag;
+  const known = [
+    ...listSessions(),
+    ...listProjects().map((p) => ({ project_tag: p.tag, cwd: p.cwd })),
+  ];
+  return deriveProjectTag(cwd, known);
 }
 
 export async function handleSessionStart(body: any): Promise<object> {

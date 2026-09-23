@@ -18,7 +18,17 @@ interface TrackedSocket extends WebSocket {
 
 export type InboundMessage =
   | { type: "decision"; clientId?: string; toolUseID: string; decision: "allow" | "deny"; message?: string }
-  | { type: "chat"; clientId?: string; content: string; replyTo?: string };
+  | {
+      type: "chat";
+      clientId?: string;
+      content: string;
+      replyTo?: string;
+      // The reply target shown in the composer when this was sent: which
+      // session the user was looking at, and how long it had been showing.
+      replyToSession?: { sessionId: string; changedMsAgo?: number };
+      // Set while the composer is answering a "which project?" list.
+      openChoice?: string;
+    };
 
 export type Reply = (payload: unknown) => void;
 
@@ -96,6 +106,16 @@ function parseInbound(raw: string): InboundMessage | null {
     clientId,
     content: parsed.content.trim(),
     replyTo: typeof parsed.replyTo === "string" ? parsed.replyTo : undefined,
+    replyToSession:
+      parsed.replyToSession && typeof parsed.replyToSession.sessionId === "string"
+        ? {
+            sessionId: parsed.replyToSession.sessionId,
+            changedMsAgo: Number.isFinite(parsed.replyToSession.changedMsAgo)
+              ? parsed.replyToSession.changedMsAgo
+              : undefined,
+          }
+        : undefined,
+    openChoice: typeof parsed.openChoice === "string" ? parsed.openChoice : undefined,
   };
 }
 

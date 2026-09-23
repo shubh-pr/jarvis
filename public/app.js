@@ -10,6 +10,9 @@ const messagesEl = document.getElementById("messages");
 const msgInput = document.getElementById("msg-input");
 const sendBtn = document.getElementById("send-btn");
 const enablePushBtn = document.getElementById("enable-push-btn");
+const replyTargetEl = document.getElementById("reply-target");
+const replyTargetLabel = document.getElementById("reply-target-label");
+const replyTargetClear = document.getElementById("reply-target-clear");
 
 let ws = null;
 let reconnectDelay = 1000;
@@ -115,7 +118,74 @@ function buildPermissionCard(div, toolUseID) {
   }, CARD_ARM_MS);
 }
 
-function appendMessage({ direction, type, content, tag, projectTag, toolUseID }) {
+// Which session an unaddressed message goes to, shown above the composer so
+// it's never a guess: it follows the newest project message on screen, a tap
+// on any message moves it there, and ✕ clears it. `changedAt` is sent along
+// (as an age) so the server can refuse a send made just after it switched.
+let replyTarget = null;
+
+// While a "which project?" list from Jarvis is open, the composer answers it
+// instead: the next message carries the list's id so the server completes
+// that open rather than treating the reply as free text. ✕ leaves this mode.
+let openChoice = null;
+let choiceButtonGroups = [];
+
+function setOpenChoice(choiceId, count) {
+  openChoice = { choiceId, count };
+  renderReplyTarget();
+}
+
+function endOpenChoice() {
+  openChoice = null;
+  choiceButtonGroups.forEach((g) => g.querySelectorAll("button").forEach((b) => (b.disabled = true)));
+  choiceButtonGroups = [];
+  renderReplyTarget();
+}
+
+function buildChoiceButtons(div, choiceId, choices) {
+  choiceButtonGroups.forEach((g) => g.querySelectorAll("button").forEach((b) => (b.disabled = true)));
+  const group = document.createElement("div");
+  group.className = "choice-actions";
+  choices.forEach((c, i) => {
+    const btn = document.createElement("button");
+    btn.className = "choice-btn";
+    btn.textContent = `${i + 1}. ${c.tag}`;
+    btn.addEventListener("click", () => {
+      if (sendInbound({ type: "chat", content: String(i + 1), openChoice: choiceId })) endOpenChoice();
+    });
+    group.appendChild(btn);
+  });
+  div.appendChild(group);
+  choiceButtonGroups = [group];
+  setOpenChoice(choiceId, choices.length);
+}
+
+function setReplyTarget(sessionId, projectTag) {
+  if (replyTarget && replyTarget.sessionId === sessionId) return;
+  replyTarget = { sessionId, projectTag, changedAt: Date.now() };
+  renderReplyTarget();
+}
+
+function renderReplyTarget() {
+  replyTargetEl.classList.toggle("hidden", !replyTarget && !openChoice);
+  replyTargetEl.classList.toggle("choosing", !!openChoice);
+  replyTargetLabel.textContent = openChoice
+    ? `Choosing which project to open — reply 1–${openChoice.count}`
+    : replyTarget
+      ? `Replying to ${replyTarget.projectTag}`
+      : "";
+}
+
+replyTargetClear.addEventListener("click", () => {
+  if (openChoice) {
+    endOpenChoice();
+    return;
+  }
+  replyTarget = null;
+  renderReplyTarget();
+});
+
+function appendMessage({ direction, type, content, tag, projectTag, toolUseID, sessionId, choiceId, choices }) {
   const div = document.createElement("div");
   const cls = type === "system" ? "system" : direction === "in" ? "in" : "out";
   div.className = `msg ${cls}`;
@@ -135,6 +205,15 @@ function appendMessage({ direction, type, content, tag, projectTag, toolUseID })
     div.classList.add("perm");
     buildPermissionCard(div, toolUseID);
   }
+  if (choiceId && Array.isArray(choices)) buildChoiceButtons(div, choiceId, choices);
+  if (sessionId && projectTag) {
+    div.classList.add("targetable");
+    div.addEventListener("click", (e) => {
+      if (e.target.closest(".perm-actions")) return; // an Approve/Deny tap isn't a retarget
+      setReplyTarget(sessionId, projectTag);
+    });
+    setReplyTarget(sessionId, projectTag);
+  }
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -143,7 +222,11 @@ function handleServerMessage(msg) {
   if (msg.type === "history") {
     messagesEl.replaceChildren();
     permissionCards.clear();
+    replyTarget = null;
+    openChoice = null;
+    choiceButtonGroups = [];
     msg.messages.forEach(appendMessage);
+    renderReplyTarget();
     return;
   }
   if (msg.type === "permissions") {
@@ -259,7 +342,17 @@ function sendMessage() {
   // with several, the server must make the user say which one.
   const pending = pendingIds();
   const replyTo = pending.length === 1 ? pending[0] : undefined;
-  if (sendInbound({ type: "chat", content: text, replyTo })) msgInput.value = "";
+  if (openChoice) {
+    if (sendInbound({ type: "chat", content: text, openChoice: openChoice.choiceId })) {
+      msgInput.value = "";
+      endOpenChoice();
+    }
+    return;
+  }
+  const replyToSession = replyTarget
+    ? { sessionId: replyTarget.sessionId, changedMsAgo: Date.now() - replyTarget.changedAt }
+    : undefined;
+  if (sendInbound({ type: "chat", content: text, replyTo, replyToSession })) msgInput.value = "";
 }
 
 sendBtn.addEventListener("click", sendMessage);
