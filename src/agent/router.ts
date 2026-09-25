@@ -75,6 +75,7 @@ function echoUser(text: string, session?: { id?: string; projectTag: string }, t
     tag: session?.projectTag ?? "you",
     sessionId: session?.id,
     projectTag: session?.projectTag,
+    projectKey: session?.id ? getSession(session.id)?.cwd ?? undefined : undefined,
   });
 }
 
@@ -230,6 +231,12 @@ function flush(sessionId: string, entry: Busy): void {
   if (!session || !entry.queued.length) return;
   spawnResume(session, texts(entry).join("\n\n"));
   say(`Sent your queued message${entry.queued.length > 1 ? "s" : ""} to "${entry.tag}".`);
+}
+
+// Whether a turn Jarvis itself started is running in this session — its
+// UserPromptSubmit carries Jarvis's own text, already recorded.
+export function isJarvisTurn(sessionId: string): boolean {
+  return busy.has(sessionId);
 }
 
 // A turn started outside Jarvis's knowledge (UserPromptSubmit), or activity
@@ -419,7 +426,11 @@ export async function handleInbound(msg: InboundMessage, reply: Reply): Promise<
     return;
   }
   const ack = (ok: boolean, extra: Record<string, unknown> = {}) => {
-    const payload = { type: "ack", clientId: msg.clientId, ok, ...extra };
+    // Acks that name a session also say which project it is, so the phone
+    // can switch to that project's history (e.g. after "open identity …").
+    const sessionId = typeof extra.sessionId === "string" ? extra.sessionId : undefined;
+    const projectKey = sessionId ? getSession(sessionId)?.cwd ?? undefined : undefined;
+    const payload = { type: "ack", clientId: msg.clientId, ok, ...extra, ...(projectKey ? { projectKey } : {}) };
     if (msg.clientId) {
       seenClientIds.set(msg.clientId, payload);
       if (seenClientIds.size > SEEN_LIMIT) seenClientIds.delete(seenClientIds.keys().next().value!);

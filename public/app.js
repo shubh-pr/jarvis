@@ -11,6 +11,24 @@ const msgInput = document.getElementById("msg-input");
 const sendBtn = document.getElementById("send-btn");
 const enablePushBtn = document.getElementById("enable-push-btn");
 const queuePanel = document.getElementById("queue-panel");
+const homeView = document.getElementById("home-view");
+const projectView = document.getElementById("project-view");
+const projectList = document.getElementById("project-list");
+const homeFeed = document.getElementById("home-feed");
+const waitingStrip = document.getElementById("waiting-strip");
+const historyPanel = document.getElementById("history-panel");
+const historyFilters = document.getElementById("history-filters");
+const blockList = document.getElementById("block-list");
+const viewingBar = document.getElementById("viewing-bar");
+const backBtn = document.getElementById("back-btn");
+const historyBtn = document.getElementById("history-btn");
+const viewTitle = document.getElementById("view-title");
+const viewSub = document.getElementById("view-sub");
+const searchBtn = document.getElementById("search-btn");
+const searchPanel = document.getElementById("search-panel");
+const searchInput = document.getElementById("search-input");
+const searchScope = document.getElementById("search-scope");
+const searchResults = document.getElementById("search-results");
 const replyTargetEl = document.getElementById("reply-target");
 const replyTargetLabel = document.getElementById("reply-target-label");
 const replyTargetClear = document.getElementById("reply-target-clear");
@@ -329,19 +347,21 @@ function renderSummary(div, summary) {
   }
 }
 
-function appendMessage({ direction, type, content, tag, projectTag, toolUseID, sessionId, choiceId, choices }) {
+function appendMessage({ id, direction, type, content, tag, projectTag, toolUseID, sessionId, choiceId, choices, createdAt }, container = messagesEl) {
   const div = document.createElement("div");
+  if (id) div.dataset.id = String(id);
   const cls = type === "system" ? "system" : direction === "in" ? "in" : "out";
   div.className = `msg ${cls}`;
   // Every message is always between exactly two parties, You and Jarvis —
   // never a project name or device on its own. The project a message
   // concerns (if any) is shown after the arrow as context, not as the sender.
+  const who = type === "prompt" ? "You, in the terminal" : "You";
   const label =
-    cls === "in" ? (projectTag ? `You → ${projectTag}` : "You") : cls === "out" ? (projectTag ? `Jarvis → ${projectTag}` : "Jarvis") : null;
+    cls === "in" ? (projectTag ? `${who} → ${projectTag}` : who) : cls === "out" ? (projectTag ? `Jarvis → ${projectTag}` : "Jarvis") : null;
   if (label && cls !== "system") {
     const tagEl = document.createElement("span");
     tagEl.className = "msg-tag";
-    tagEl.textContent = label;
+    tagEl.textContent = `${label} · ${clock(createdAt ?? Date.now())}`;
     div.appendChild(tagEl);
   }
   const questions = type === "permission_request" && toolUseID ? permissions.get(toolUseID)?.questions : undefined;
@@ -364,8 +384,8 @@ function appendMessage({ direction, type, content, tag, projectTag, toolUseID, s
     });
     setReplyTarget(sessionId, projectTag);
   }
-  messagesEl.appendChild(div);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
 }
 
 // Messages waiting for a busy session, straight from the server's queue —
@@ -397,25 +417,436 @@ function renderQueue(sessions) {
   }
 }
 
+// ---- Per-project history ----
+// A project is its full path (projectKey), never its display name. Home is
+// the list of projects; opening one shows its latest block of work, live;
+// History browses earlier blocks by date. Anything waiting on you, from
+// any project, stays in the strip at the top of every screen.
+let projects = new Map();
+let currentProject = null; // projectKey, or null on the home screen
+let viewingLive = true; // viewing the latest block (new messages append)
+const unread = new Map(); // projectKey -> count of messages that arrived elsewhere
+const home = "~";
+
+async function api(pathAndQuery) {
+  const res = await fetch(pathAndQuery, { headers: { Authorization: `Bearer ${getToken()}` } });
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+function clock(ms) {
+  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function dayLabel(ms) {
+  const d = new Date(ms), today = new Date();
+  const startOf = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((startOf(today) - startOf(d)) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  return d.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+}
+
+function ago(ms) {
+  if (!ms) return "not used yet";
+  const mins = Math.round((Date.now() - ms) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1440) return `${Math.round(mins / 60)}h ago`;
+  return dayLabel(ms);
+}
+
+function prettyPath(key) {
+  const m = /^\/Users\/[^/]+(\/.*)$/.exec(key);
+  return m ? `${home}${m[1]}` : key;
+}
+
+function pendingByProject() {
+  const counts = new Map();
+  for (const p of permissions.values()) {
+    if (p.status === "pending" && p.projectKey) counts.set(p.projectKey, (counts.get(p.projectKey) ?? 0) + 1);
+  }
+  return counts;
+}
+
+async function loadProjects() {
+  const { projects: list } = await api("/api/projects");
+  projects = new Map(list.map((p) => [p.key, p]));
+  if (!currentProject) renderHome();
+  renderWaiting();
+}
+
+function projectRow(p, pending) {
+  const row = document.createElement("button");
+  row.className = "project-row";
+  const main = document.createElement("div");
+  main.className = "project-main";
+  const name = document.createElement("div");
+  name.className = "project-name";
+  name.textContent = p.tag;
+  const where = document.createElement("div");
+  where.className = "project-path";
+  where.textContent = prettyPath(p.key);
+  main.append(name, where);
+  const side = document.createElement("div");
+  side.className = "project-side";
+  const when = document.createElement("div");
+  when.className = "project-when";
+  when.textContent = ago(p.lastActivity);
+  side.appendChild(when);
+  const badges = document.createElement("div");
+  if (pending) badges.append(badge(`${pending} waiting`, "waiting"));
+  if (unread.get(p.key)) badges.append(badge(`${unread.get(p.key)} new`, "new"));
+  side.appendChild(badges);
+  row.append(main, side);
+  row.addEventListener("click", () => openProject(p.key));
+  return row;
+}
+
+function badge(text, kind) {
+  const b = document.createElement("span");
+  b.className = `badge ${kind}`;
+  b.textContent = text;
+  return b;
+}
+
+function renderHome() {
+  projectList.replaceChildren();
+  const pending = pendingByProject();
+  const list = [...projects.values()];
+  const used = list.filter((p) => p.messageCount > 0 || pending.get(p.key));
+  const unusedList = list.filter((p) => !used.includes(p));
+  const heading = document.createElement("div");
+  heading.className = "list-heading";
+  heading.textContent = used.length ? "Projects" : "No conversations yet — say \"open <project> <instruction>\" to start one.";
+  projectList.appendChild(heading);
+  for (const p of used) projectList.appendChild(projectRow(p, pending.get(p.key)));
+  if (unusedList.length) {
+    const more = document.createElement("details");
+    more.className = "unused-projects";
+    const summary = document.createElement("summary");
+    summary.textContent = `Registered, not used yet (${unusedList.length})`;
+    more.appendChild(summary);
+    for (const p of unusedList) more.appendChild(projectRow(p, 0));
+    projectList.appendChild(more);
+  }
+}
+
+function renderWaiting() {
+  waitingStrip.replaceChildren();
+  const elsewhere = [...pendingByProject()].filter(([key]) => key !== currentProject || !viewingLive);
+  waitingStrip.classList.toggle("hidden", !elsewhere.length);
+  for (const [key, n] of elsewhere) {
+    const btn = document.createElement("button");
+    btn.className = "waiting-item";
+    const tag = projects.get(key)?.tag ?? prettyPath(key);
+    btn.textContent = `${tag} is waiting on you${n > 1 ? ` (${n})` : ""} ›`;
+    btn.addEventListener("click", () => openProject(key));
+    waitingStrip.appendChild(btn);
+  }
+  if (!currentProject) renderHome();
+}
+
+function showHome() {
+  currentProject = null;
+  viewingLive = true;
+  replyTarget = null;
+  renderReplyTarget();
+  homeView.classList.remove("hidden");
+  projectView.classList.add("hidden");
+  backBtn.classList.add("hidden");
+  historyBtn.classList.add("hidden");
+  historyPanel.classList.add("hidden");
+  viewTitle.textContent = "JARVIS";
+  viewSub.classList.add("hidden");
+  history.replaceState(null, "", "/");
+  loadProjects().catch(() => {});
+}
+
+// Opens a project: its latest block of work, live — or, given a block from
+// History or a search result, that block, optionally scrolled to one message.
+async function openProject(key, block, focusMessageId) {
+  currentProject = key;
+  const p = projects.get(key);
+  homeView.classList.add("hidden");
+  projectView.classList.remove("hidden");
+  backBtn.classList.remove("hidden");
+  historyBtn.classList.remove("hidden");
+  historyPanel.classList.add("hidden");
+  viewTitle.textContent = p?.tag ?? "Project";
+  viewSub.textContent = prettyPath(key);
+  viewSub.classList.remove("hidden");
+  history.replaceState(null, "", `/?project=${encodeURIComponent(key)}`);
+  unread.delete(key);
+
+  let from = 0;
+  let to = Number.MAX_SAFE_INTEGER;
+  const { blocks } = await api(`/api/projects/blocks?key=${encodeURIComponent(key)}`);
+  const latest = blocks[0];
+  viewingLive = !block || (latest && block.start === latest.start);
+  if (viewingLive && latest) from = latest.start;
+  if (!viewingLive) ({ start: from, end: to } = block);
+  const { messages } = await api(`/api/projects/messages?key=${encodeURIComponent(key)}&from=${from}&to=${to}`);
+  if (currentProject !== key) return; // switched away while loading
+  messagesEl.replaceChildren();
+  permissionCards.clear();
+  replyTarget = null;
+  for (const m of messages) appendMessage({ ...m, tag: m.projectTag });
+  if (!viewingLive) replyTarget = null; // an old block isn't where a reply goes
+  renderReplyTarget();
+  renderViewingBar(viewingLive ? latest : block, viewingLive);
+  renderWaiting();
+  if (focusMessageId) {
+    const el = messagesEl.querySelector(`[data-id="${focusMessageId}"]`);
+    if (el) {
+      el.scrollIntoView({ block: "center" });
+      el.classList.add("found");
+      setTimeout(() => el.classList.remove("found"), 2500);
+    }
+  }
+}
+
+// ---- Search across all history ----
+// Words, not meaning. One result per conversation, best match first, with
+// the match highlighted in context; tapping one opens that conversation at
+// that message. Scope to the open project, or search everything.
+let searchScopeKey = null; // null = all projects
+let searchSeq = 0;
+let searchTimer = null;
+
+function openSearch() {
+  searchPanel.classList.remove("hidden");
+  historyPanel.classList.add("hidden");
+  searchScopeKey = null;
+  renderSearchScope();
+  searchInput.focus();
+  runSearch();
+}
+
+function closeSearch() {
+  searchPanel.classList.add("hidden");
+}
+
+function renderSearchScope() {
+  searchScope.replaceChildren();
+  const options = [["All projects", null]];
+  if (currentProject) options.push([`Only ${projects.get(currentProject)?.tag ?? "this project"}`, currentProject]);
+  if (options.length < 2) return;
+  for (const [label, key] of options) {
+    const chip = document.createElement("button");
+    chip.className = `filter-chip${key === searchScopeKey ? " active" : ""}`;
+    chip.textContent = label;
+    chip.addEventListener("click", () => {
+      searchScopeKey = key;
+      renderSearchScope();
+      runSearch();
+    });
+    searchScope.appendChild(chip);
+  }
+}
+
+function highlighted(snippet) {
+  const span = document.createElement("span");
+  const parts = snippet.split(/(\u0002[^\u0003]*\u0003)/);
+  for (const part of parts) {
+    if (part.startsWith("\u0002")) {
+      const mark = document.createElement("mark");
+      mark.textContent = part.slice(1, -1);
+      span.appendChild(mark);
+    } else if (part) {
+      span.appendChild(document.createTextNode(part));
+    }
+  }
+  return span;
+}
+
+function resultRow(r) {
+  const row = document.createElement("button");
+  row.className = "search-result";
+  const head = document.createElement("div");
+  head.className = "search-result-head";
+  const tag = document.createElement("span");
+  tag.className = "search-result-project";
+  tag.textContent = r.projectTag;
+  const when = document.createElement("span");
+  when.className = "search-result-when";
+  when.textContent = `${dayLabel(r.at)} ${clock(r.at)}`;
+  head.append(tag, when);
+  const where = document.createElement("div");
+  where.className = "project-path";
+  where.textContent = prettyPath(r.projectKey);
+  const title = document.createElement("div");
+  title.className = "search-result-title";
+  title.textContent = r.block.title;
+  const snip = document.createElement("div");
+  snip.className = "search-result-snippet";
+  snip.appendChild(highlighted(r.snippet));
+  // The title only adds something when it isn't the matching message itself.
+  const plain = (t) => t.replace(/[\u0002\u0003…]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+  const titleIsSnippet = plain(r.snippet).startsWith(plain(r.block.title).slice(0, 40));
+  row.append(head, where, ...(titleIsSnippet ? [] : [title]), snip);
+  if (r.otherMatches) {
+    const more = document.createElement("div");
+    more.className = "search-result-more";
+    more.textContent = `+${r.otherMatches} more match${r.otherMatches > 1 ? "es" : ""} in this conversation`;
+    row.appendChild(more);
+  }
+  row.addEventListener("click", () => {
+    closeSearch();
+    loadProjects()
+      .catch(() => {})
+      .then(() => openProject(r.projectKey, r.block, r.messageId));
+  });
+  return row;
+}
+
+async function runSearch() {
+  const q = searchInput.value.trim();
+  const seq = ++searchSeq;
+  if (!q) {
+    searchResults.replaceChildren();
+    return;
+  }
+  const scope = searchScopeKey ? `&key=${encodeURIComponent(searchScopeKey)}` : "";
+  const { results, partial } = await api(`/api/search?q=${encodeURIComponent(q)}${scope}`);
+  if (seq !== searchSeq) return; // a newer search has started
+  searchResults.replaceChildren();
+  if (!results.length && !partial.length) {
+    const none = document.createElement("div");
+    none.className = "list-heading";
+    none.textContent = "No conversations mention that.";
+    searchResults.appendChild(none);
+  }
+  for (const r of results) searchResults.appendChild(resultRow(r));
+  if (partial.length) {
+    const h = document.createElement("div");
+    h.className = "day-heading";
+    h.textContent = results.length ? "Partial matches — some of your words" : "No conversation has all your words — partial matches";
+    searchResults.appendChild(h);
+    for (const r of partial) searchResults.appendChild(resultRow(r));
+  }
+}
+
+searchBtn.addEventListener("click", () => {
+  if (searchPanel.classList.contains("hidden")) openSearch();
+  else closeSearch();
+});
+searchInput.addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => runSearch().catch(() => {}), 250);
+});
+
+function renderViewingBar(block, live) {
+  viewingBar.replaceChildren();
+  if (!block) {
+    viewingBar.classList.add("hidden");
+    return;
+  }
+  viewingBar.classList.remove("hidden");
+  viewingBar.classList.toggle("old", !live);
+  const text = document.createElement("span");
+  text.textContent = live
+    ? `Latest · since ${dayLabel(block.start)} ${clock(block.start)}`
+    : `${dayLabel(block.start)} · ${clock(block.start)}–${clock(block.end)} · ${block.title}`;
+  viewingBar.appendChild(text);
+  if (!live) {
+    const back = document.createElement("button");
+    back.textContent = "Back to latest";
+    back.addEventListener("click", () => openProject(currentProject));
+    viewingBar.appendChild(back);
+  }
+}
+
+// History: this project's blocks of work, newest first, grouped by day,
+// filterable by date.
+const FILTERS = [
+  ["All", () => [0, Number.MAX_SAFE_INTEGER]],
+  ["Today", () => [startOfDay(0), Number.MAX_SAFE_INTEGER]],
+  ["Yesterday", () => [startOfDay(1), startOfDay(0) - 1]],
+  ["Last 7 days", () => [startOfDay(6), Number.MAX_SAFE_INTEGER]],
+];
+let activeFilter = "All";
+
+function startOfDay(daysAgo) {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() - daysAgo).getTime();
+}
+
+async function showHistory(range = FILTERS[0][1](), label = "All") {
+  activeFilter = label;
+  historyPanel.classList.remove("hidden");
+  historyFilters.replaceChildren();
+  for (const [name, fn] of FILTERS) {
+    const chip = document.createElement("button");
+    chip.className = `filter-chip${name === activeFilter ? " active" : ""}`;
+    chip.textContent = name;
+    chip.addEventListener("click", () => showHistory(fn(), name));
+    historyFilters.appendChild(chip);
+  }
+  const picker = document.createElement("input");
+  picker.type = "date";
+  picker.className = "filter-date";
+  picker.addEventListener("change", () => {
+    if (!picker.value) return;
+    const [y, m, d] = picker.value.split("-").map(Number);
+    const start = new Date(y, m - 1, d).getTime();
+    showHistory([start, start + 86400000 - 1], picker.value);
+  });
+  historyFilters.appendChild(picker);
+
+  const key = currentProject;
+  const { blocks } = await api(`/api/projects/blocks?key=${encodeURIComponent(key)}&from=${range[0]}&to=${range[1]}`);
+  if (currentProject !== key) return;
+  blockList.replaceChildren();
+  if (!blocks.length) {
+    const none = document.createElement("div");
+    none.className = "list-heading";
+    none.textContent = "Nothing in this period.";
+    blockList.appendChild(none);
+  }
+  let lastDay = "";
+  for (const b of blocks) {
+    const day = dayLabel(b.start);
+    if (day !== lastDay) {
+      const h = document.createElement("div");
+      h.className = "day-heading";
+      h.textContent = day;
+      blockList.appendChild(h);
+      lastDay = day;
+    }
+    const row = document.createElement("button");
+    row.className = "block-row";
+    const title = document.createElement("div");
+    title.className = "block-title";
+    title.textContent = b.title;
+    const meta = document.createElement("div");
+    meta.className = "block-meta";
+    const until = dayLabel(b.end) !== day ? `${dayLabel(b.end)} ${clock(b.end)}` : clock(b.end);
+    meta.textContent = `${clock(b.start)} – ${until} · ${b.count} message${b.count === 1 ? "" : "s"}`;
+    row.append(title, meta);
+    row.addEventListener("click", () => openProject(key, b));
+    blockList.appendChild(row);
+  }
+}
+
+backBtn.addEventListener("click", showHome);
+historyBtn.addEventListener("click", () => {
+  if (historyPanel.classList.contains("hidden")) showHistory();
+  else historyPanel.classList.add("hidden");
+});
+
+const NAVIGATING_ACTIONS = new Set(["launching", "instructed", "queued", "already_open", "starting", "sent_now"]);
+
 function handleServerMessage(msg) {
   if (msg.type === "queue") {
     renderQueue(msg.sessions);
-    return;
-  }
-  if (msg.type === "history") {
-    messagesEl.replaceChildren();
-    permissionCards.clear();
-    replyTarget = null;
-    openChoice = null;
-    choiceButtonGroups = [];
-    msg.messages.forEach(appendMessage);
-    renderReplyTarget();
     return;
   }
   if (msg.type === "permissions") {
     permissions.clear();
     for (const item of msg.items) permissions.set(item.toolUseID, item);
     for (const id of permissionCards.keys()) renderCardState(id);
+    renderWaiting();
     return;
   }
   if (msg.type === "ack") {
@@ -426,9 +857,32 @@ function handleServerMessage(msg) {
       card?.actions.querySelectorAll("button").forEach((b) => (b.disabled = false));
       renderCardState(msg.toolUseID);
     }
+    // "open identity …" (or a reply that went to another project) takes you
+    // to that project's history.
+    if (msg.ok && msg.projectKey && NAVIGATING_ACTIONS.has(msg.action) && msg.projectKey !== currentProject) {
+      loadProjects().then(() => openProject(msg.projectKey)).catch(() => {});
+    }
     return;
   }
-  appendMessage(msg);
+  // Project messages go to their own project; Jarvis's replies and notes
+  // appear wherever you are.
+  const key = msg.projectKey;
+  if (key) {
+    const p = projects.get(key);
+    if (p) {
+      p.lastActivity = Date.now();
+      p.messageCount = (p.messageCount ?? 0) + 1;
+    } else {
+      loadProjects().catch(() => {});
+    }
+    if (currentProject === key && viewingLive) appendMessage(msg);
+    else {
+      unread.set(key, (unread.get(key) ?? 0) + 1);
+      if (!currentProject) renderHome();
+    }
+    return;
+  }
+  appendMessage(msg, currentProject ? messagesEl : homeFeed);
 }
 
 async function login(passcode) {
@@ -470,6 +924,16 @@ function connect() {
     connStatus.textContent = "connected";
     connStatus.className = "connected";
     reconnectDelay = 1000;
+    // Reconnecting keeps you where you were; a notification's link
+    // (?project=…) opens that project.
+    const linked = new URLSearchParams(location.search).get("project");
+    loadProjects()
+      .then(() => {
+        const target = currentProject ?? linked;
+        if (target) openProject(target);
+        else showHome();
+      })
+      .catch(() => {});
   };
 
   ws.onmessage = (event) => {

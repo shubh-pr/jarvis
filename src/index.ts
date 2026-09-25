@@ -8,12 +8,15 @@ import {
   removePushSubscription,
   markPendingPermissionsStale,
   clearStartingSessions,
+  repairSessionFolders,
 } from "./db.js";
 import { serveStatic } from "./staticServer.js";
 import { attachWebSocketServer } from "./wsServer.js";
 import { broadcastPush } from "./push.js";
 import { resolvePermission } from "./agent/permissions.js";
 import { handleInbound } from "./agent/router.js";
+import { listProjectHistories, projectBlocks, projectMessages } from "./agent/history.js";
+import { searchHistory } from "./agent/search.js";
 import { handleSessionStart, handleUserPromptSubmit, handlePermissionRequest, handleStop } from "./hooks/routes.js";
 
 function readJsonBody(req: http.IncomingMessage): Promise<any> {
@@ -204,6 +207,29 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Per-project history: /api/projects, and ?key=<project path> for one
+  // project's blocks or messages, optionally within [from, to] (epoch ms).
+  const url = new URL(req.url ?? "/", "http://localhost");
+  // Search across all history, or one project with ?key=<project path>.
+  if (req.method === "GET" && url.pathname === "/api/search") {
+    if (!requireAuth(req, res)) return;
+    return sendJson(res, 200, searchHistory(url.searchParams.get("q") ?? "", url.searchParams.get("key") || undefined));
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/api/projects")) {
+    if (!requireAuth(req, res)) return;
+    const key = url.searchParams.get("key") ?? "";
+    const num = (name: string) => {
+      const v = url.searchParams.get(name);
+      return v !== null && Number.isFinite(Number(v)) ? Number(v) : undefined;
+    };
+    if (url.pathname === "/api/projects") return sendJson(res, 200, { projects: listProjectHistories() });
+    if (!key) return sendJson(res, 400, { error: "Missing project key" });
+    if (url.pathname === "/api/projects/blocks") return sendJson(res, 200, { blocks: projectBlocks(key, num("from"), num("to")) });
+    if (url.pathname === "/api/projects/messages") return sendJson(res, 200, { messages: projectMessages(key, num("from"), num("to")) });
+    return sendJson(res, 404, { error: "Not found" });
+  }
+
   if (serveStatic(req, res)) return;
 
   res.writeHead(404, { "Content-Type": "text/plain" });
@@ -221,6 +247,7 @@ server.headersTimeout = 0;
 const staleCount = markPendingPermissionsStale();
 if (staleCount) console.log(`Marked ${staleCount} permission request(s) from a previous run as stale.`);
 clearStartingSessions();
+for (const f of repairSessionFolders()) console.log(`Session ${f.id.slice(0, 8)}: folder corrected from ${f.from} to ${f.to} (from its transcript).`);
 
 attachWebSocketServer(server, handleInbound);
 

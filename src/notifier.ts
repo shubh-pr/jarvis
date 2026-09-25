@@ -1,5 +1,6 @@
 import { broadcast, hasConnectedClients } from "./wsServer.js";
 import { broadcastPush } from "./push.js";
+import { getSession } from "./db.js";
 import type { MessageType } from "./types.js";
 
 export interface NotifyEvent {
@@ -31,6 +32,8 @@ function truncate(text: string, max: number): string {
 }
 
 export async function notify(event: NotifyEvent): Promise<void> {
+  // The project a message belongs to is its full path; the phone files it there.
+  const projectKey = getSession(event.sessionId)?.cwd ?? undefined;
   broadcast({
     direction: "out",
     type: event.type,
@@ -38,6 +41,7 @@ export async function notify(event: NotifyEvent): Promise<void> {
     tag: event.projectTag,
     sessionId: event.sessionId,
     projectTag: event.projectTag,
+    projectKey,
     toolUseID: event.toolUseID,
   });
 
@@ -47,7 +51,7 @@ export async function notify(event: NotifyEvent): Promise<void> {
       title: pushTitle,
       body: truncate(`[${event.projectTag}] ${event.content}`, PUSH_BODY_MAX),
       sessionId: event.sessionId,
-      url: "/",
+      url: projectKey ? `/?project=${encodeURIComponent(projectKey)}` : "/",
     });
   }
 }

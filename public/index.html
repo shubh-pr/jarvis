@@ -22,13 +22,39 @@
 
     <div id="chat-screen" class="hidden">
       <header>
-        <h1>JARVIS</h1>
+        <div class="header-left">
+          <button id="back-btn" class="hidden" aria-label="All projects">‹</button>
+          <div>
+            <h1 id="view-title">JARVIS</h1>
+            <div id="view-sub" class="hidden"></div>
+          </div>
+        </div>
         <div style="display:flex; align-items:center; gap:8px;">
-          <button id="enable-push-btn" class="hidden">Enable notifications</button>
+          <button id="search-btn" aria-label="Search history">Search</button>
+          <button id="history-btn" class="hidden">History</button>
+          <button id="enable-push-btn" class="hidden" title="Enable notifications">Notify</button>
           <span id="conn-status" class="disconnected">connecting…</span>
         </div>
       </header>
-      <div id="messages"></div>
+      <!-- Anything that needs you, from any project, stays visible on every screen. -->
+      <div id="waiting-strip" class="hidden"></div>
+      <div id="search-panel" class="hidden">
+        <input id="search-input" type="search" placeholder="Search all conversations…" autocomplete="off" />
+        <div id="search-scope"></div>
+        <div id="search-results"></div>
+      </div>
+      <div id="home-view">
+        <div id="project-list"></div>
+        <div id="home-feed"></div>
+      </div>
+      <div id="project-view" class="hidden">
+        <div id="history-panel" class="hidden">
+          <div id="history-filters"></div>
+          <div id="block-list"></div>
+        </div>
+        <div id="viewing-bar" class="hidden"></div>
+        <div id="messages"></div>
+      </div>
       <div id="queue-panel" class="hidden"></div>
       <div id="reply-target" class="hidden">
         <span id="reply-target-label"></span>

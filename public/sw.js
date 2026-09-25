@@ -1,4 +1,4 @@
-const CACHE_NAME = "jarvis-shell-v11";
+const CACHE_NAME = "jarvis-shell-v13";
 const SHELL_ASSETS = [
   "/",
   "/app.js",

@@ -25,7 +25,8 @@ export type MessageType =
   | "permission_decision"
   | "completion"
   | "error"
-  | "idle_nudge";
+  | "idle_nudge"
+  | "prompt"; // a prompt you typed in a terminal session
 
 export interface MessageRecord {
   id: number;

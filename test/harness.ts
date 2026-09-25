@@ -447,22 +447,24 @@ async function scenarioGhostAndResync(pushPort: number) {
 
     const fresh = await Client.open(srv.port, token);
     const snap = await fresh.waitFor((e) => e.type === "permissions");
-    const history = await fresh.waitFor((e) => e.type === "history");
     const itemA = snap?.items?.find((i: any) => i.toolUseID === idA);
     const itemB = snap?.items?.find((i: any) => i.toolUseID === idB);
     check("3.3 on reconnect, pending state is resynced: #B pending, resolved #A not shown as pending",
       itemB?.status === "pending" && (!itemA || itemA.status !== "pending"),
       snap ? `A=${JSON.stringify(itemA)} B=${JSON.stringify(itemB)} (ack for A: ${describeAck(ackA)})` : "no permissions snapshot on connect");
 
-    const replayedReqs = (history?.messages ?? []).filter((m: any) => m.type === "permission_request");
-    check("3.4 history arrives as one snapshot, and each replayed request carries its toolUseID",
+    // History is per project now: the project's messages replay each request with its toolUseID.
+    const projRes = await fetch(`http://localhost:${srv.port}/api/projects/messages?key=${encodeURIComponent(cwd)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    }).then((r) => r.json());
+    const replayedReqs = (projRes.messages ?? []).filter((m: any) => m.type === "permission_request");
+    check("3.4 a project's history replays each permission request with its toolUseID",
       replayedReqs.length === 2 && replayedReqs.every((m: any) => m.toolUseID),
-      history ? `replayed requests: ${JSON.stringify(replayedReqs)}` : "no history snapshot — backlog replayed as loose messages");
+      `replayed requests: ${JSON.stringify(replayedReqs)}`);
 
-    const snapIdx = fresh.events.findIndex((e) => e.type === "permissions");
-    const histIdx = fresh.events.findIndex((e) => e.type === "history");
-    check("3.5 permission states arrive before the history they label (no stale-button flash on reconnect)",
-      snapIdx !== -1 && histIdx !== -1 && snapIdx < histIdx, `permissions at #${snapIdx}, history at #${histIdx}`);
+    check("3.5 permission states arrive on connect, before the client fetches any history to label",
+      fresh.events.findIndex((e) => e.type === "permissions") !== -1 && !fresh.events.some((e) => e.type === "history"),
+      `events: ${JSON.stringify(fresh.events.map((e) => e.type))}`);
 
     hB.abort();
     fresh.close();
@@ -1586,6 +1588,213 @@ async function scenarioGatingAndCards() {
   }
 }
 
+type Seed = { at: number; direction: string; type: string; content: string; toolUseId?: string };
+function seedSession(dbPath: string, sessionId: string, tag: string, cwd: string, msgs: Seed[], transcriptPath?: string): void {
+  const db = new Database(dbPath);
+  db.pragma("busy_timeout = 5000");
+  const first = msgs[0]?.at ?? Date.now();
+  db.prepare(`INSERT OR REPLACE INTO sessions (id, project_tag, status, last_event_at, transcript_path, cwd, created_at) VALUES (?, ?, 'waiting_input', ?, ?, ?, ?)`)
+    .run(sessionId, tag, msgs[msgs.length - 1]?.at ?? first, transcriptPath ?? null, cwd, first);
+  const ins = db.prepare(`INSERT INTO messages (session_id, direction, type, content, created_at, tool_use_id) VALUES (?, ?, ?, ?, ?, ?)`);
+  for (const m of msgs) ins.run(sessionId, m.direction, m.type, m.content, m.at, m.toolUseId ?? null);
+  db.close();
+}
+
+async function scenarioProjectHistory() {
+  resetClaudeLog();
+  let srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const get = (q: string) => fetch(`http://localhost:${srv.port}${q}`, auth).then((r) => r.json());
+    const H = 3600_000, M = 60_000;
+    const midnight = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() - 2).getTime(); // two days ago, 00:00
+
+    // Two repos both called "identity", in different product areas.
+    const idA = "/work/NOBLEABLE-BE/identity", idB = "/work/IDENTICA360/identity";
+    seedSession(srv.dbPath, "sess-id-a", "identity", idA, [
+      { at: midnight - 30 * M, direction: "in", type: "chat", content: "find out bottle neck in identity" },
+      { at: midnight - 25 * M, direction: "out", type: "completion", content: "The slow part is the tenant lookup. Details follow." },
+      { at: midnight + 40 * M, direction: "out", type: "completion", content: "Done with the report." },             // 70 min later: same block, past midnight
+      { at: midnight + 4 * H, direction: "in", type: "prompt", content: "now write the fix for the tenant cache" }, // 3h20 quiet: new block
+      { at: midnight + 4 * H + 5 * M, direction: "out", type: "completion", content: "Fix written." },
+    ]);
+    seedSession(srv.dbPath, "sess-id-b", "identity (IDENTICA360)", idB, [
+      { at: midnight + 1 * H, direction: "out", type: "completion", content: "Migrated the schema to v2. All green." },
+    ]);
+    registerProjectDirect(srv.dbPath, "permission-only", "/work/other/perm-only");
+    const permDb = new Database(srv.dbPath);
+    permDb.prepare(`INSERT INTO permissions (tool_use_id, session_id, project_tag, tool_name, content, status, created_at, summary) VALUES ('tu-1', 'sess-perm', 'permission-only', 'Bash', 'x', 'allowed', ?, ?)`)
+      .run(midnight + 2 * H, JSON.stringify({ title: "Compile the project to verify changes", tags: [], detail: "./mvnw -o compile" }));
+    permDb.close();
+    seedSession(srv.dbPath, "sess-perm", "permission-only", "/work/other/perm-only", [
+      { at: midnight + 2 * H, direction: "out", type: "permission_request", content: "Compile…", toolUseId: "tu-1" },
+    ]);
+
+    const { projects } = await get("/api/projects");
+    const identities = projects.filter((p: any) => p.key === idA || p.key === idB);
+    const aMsgs = (await get(`/api/projects/messages?key=${encodeURIComponent(idA)}`)).messages;
+    check("19.1 two repos named 'identity' are separate projects keyed by full path, and their histories never mix",
+      identities.length === 2 && new Set(identities.map((p: any) => p.tag)).size === 2 &&
+        aMsgs.length === 5 && aMsgs.every((m: any) => m.projectKey === idA) && !aMsgs.some((m: any) => m.content.includes("schema")),
+      `projects=${JSON.stringify(identities)}; a=${aMsgs.length} msgs`);
+
+    const aBlocks = (await get(`/api/projects/blocks?key=${encodeURIComponent(idA)}`)).blocks;
+    check("19.2 a project's history splits into blocks at a 2h quiet gap, newest first",
+      aBlocks.length === 2 && aBlocks[0].start === midnight + 4 * H && aBlocks[1].count === 3, JSON.stringify(aBlocks));
+    check("19.3 a block that runs past midnight stays one block — the date is a label, not a split",
+      aBlocks[1].start === midnight - 30 * M && aBlocks[1].end === midnight + 40 * M, JSON.stringify(aBlocks[1]));
+
+    const bBlocks = (await get(`/api/projects/blocks?key=${encodeURIComponent(idB)}`)).blocks;
+    const pBlocks = (await get(`/api/projects/blocks?key=${encodeURIComponent("/work/other/perm-only")}`)).blocks;
+    check("19.4 titles come from what's there: your first message (PWA or terminal), else the request's headline, else Claude's first sentence",
+      aBlocks[1].title === "find out bottle neck in identity" && aBlocks[0].title === "now write the fix for the tenant cache" &&
+        pBlocks[0]?.title === "Compile the project to verify changes" && bBlocks[0]?.title === "Migrated the schema to v2.",
+      JSON.stringify({ a: aBlocks.map((b: any) => b.title), p: pBlocks[0]?.title, b: bBlocks[0]?.title }));
+
+    const dayTwo = (await get(`/api/projects/blocks?key=${encodeURIComponent(idA)}&from=${midnight + 3 * H}&to=${midnight + 24 * H}`)).blocks;
+    const dayOne = (await get(`/api/projects/blocks?key=${encodeURIComponent(idA)}&from=${midnight - 24 * H}&to=${midnight - 1}`)).blocks;
+    check("19.5 filtering by date returns the blocks active in that range — including one that started the evening before",
+      dayTwo.length === 1 && dayTwo[0].title.startsWith("now write") && dayOne.length === 1 && dayOne[0].title.startsWith("find out"),
+      JSON.stringify({ dayTwo, dayOne }));
+
+    const blockMsgs = (await get(`/api/projects/messages?key=${encodeURIComponent(idA)}&from=${aBlocks[1].start}&to=${aBlocks[1].end}`)).messages;
+    check("19.6 opening a block returns exactly its messages, in order",
+      blockMsgs.length === 3 && blockMsgs[0].content.startsWith("find out") && blockMsgs[2].content === "Done with the report.",
+      JSON.stringify(blockMsgs.map((m: any) => m.content)));
+
+    const noAuth = await fetch(`http://localhost:${srv.port}/api/projects`).then((r) => r.status);
+    check("19.7 history endpoints need the passcode login like everything else", noAuth === 401, `status=${noAuth}`);
+
+    // A session's folder is where it started; later hooks from wherever Claude cd'd don't move it.
+    const c = await Client.open(srv.port, token);
+    const home = fs.realpathSync(projectDir("drift-home"));
+    const elsewhere = fs.realpathSync(projectDir("drift-elsewhere"));
+    await userPromptSubmitHook(srv.port, "sess-drift", home, "look around the repo");
+    const ph = permissionHook(srv.port, "sess-drift", elsewhere, "cat ../somewhere/else");
+    const pid = await c.toolUseIdFor("sess-drift", "cat ../somewhere/else");
+    const live = c.latest((e) => e.type === "permission_request" && e.toolUseID === pid);
+    await c.request({ type: "decision", toolUseID: pid, decision: "allow" });
+    await until(() => ph.settled, 1000);
+    await stopHook(srv.port, "sess-drift", elsewhere);
+    resetClaudeLog();
+    await c.request({ type: "chat", content: "carry on", replyToSession: { sessionId: "sess-drift", changedMsAgo: 5000 } });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const homeMsgs = (await get(`/api/projects/messages?key=${encodeURIComponent(home)}`)).messages;
+    const awayMsgs = (await get(`/api/projects/messages?key=${encodeURIComponent(elsewhere)}`)).messages;
+    check("19.8 a session stays filed under the folder it started in, and resumes there, even after Claude cd's elsewhere",
+      homeMsgs.length >= 3 && awayMsgs.length === 0 && claudeInvocations()[0]?.startsWith(`cwd=${home} `) && live?.projectKey === home,
+      `home=${homeMsgs.length}, elsewhere=${awayMsgs.length}; claude=${JSON.stringify(claudeInvocations())}; event key=${live?.projectKey}`);
+    check("19.9 a prompt typed in a terminal is recorded in the project's history; one Jarvis sent isn't recorded twice",
+      homeMsgs.filter((m: any) => m.type === "prompt").length === 1 && homeMsgs.some((m: any) => m.type === "prompt" && m.content === "look around the repo"),
+      JSON.stringify(homeMsgs.map((m: any) => `${m.type}:${m.content.slice(0, 20)}`)));
+    await userPromptSubmitHook(srv.port, "sess-drift", home, "carry on"); // the Jarvis-sent turn's own prompt
+    await sleep(200);
+    const after = (await get(`/api/projects/messages?key=${encodeURIComponent(home)}`)).messages.filter((m: any) => m.type === "prompt");
+    check("19.10 …the Jarvis-sent turn's UserPromptSubmit adds no second copy", after.length === 1, JSON.stringify(after));
+    c.close();
+
+    // Sessions stored before folders were fixed get repaired from their transcript at startup.
+    const transcript = path.join(TMP, "drifted.jsonl");
+    fs.writeFileSync(transcript, `{"type":"user","cwd":"/work/NOBLEABLE-BE/auth-central","message":{}}\n{"type":"assistant","cwd":"/work"}\n`);
+    seedSession(srv.dbPath, "sess-drifted", "auth-central", "/work", [{ at: midnight, direction: "out", type: "completion", content: "old" }], transcript);
+    await killServer(srv);
+    srv = await startServer({ port: srv.port, dbPath: srv.dbPath });
+    const repaired = (await fetch(`http://localhost:${srv.port}/api/projects/messages?key=${encodeURIComponent("/work/NOBLEABLE-BE/auth-central")}`, auth).then((r) => r.json())).messages;
+    check("19.11 on startup, a session whose stored folder drifted is put back under the folder its transcript started in",
+      repaired.length === 1 && repaired[0].sessionId === "sess-drifted", JSON.stringify(repaired));
+  } finally {
+    await killServer(srv);
+  }
+}
+
+async function scenarioSearch() {
+  let srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const search = (q: string, key?: string) =>
+      fetch(`http://localhost:${srv.port}/api/search?q=${encodeURIComponent(q)}${key ? `&key=${encodeURIComponent(key)}` : ""}`, auth).then((r) => r.json());
+    const H = 3600_000, M = 60_000;
+    const t0 = Date.now() - 10 * 24 * H;
+    const idA = "/work/NOBLEABLE-BE/identity", idB = "/work/IDENTICA360/identity", auth2 = "/work/NOBLEABLE-BE/auth-central";
+
+    // identity (NOBLEABLE-BE): an old, RBAC-heavy conversation with several mentions…
+    seedSession(srv.dbPath, "s-a1", "identity", idA, [
+      { at: t0, direction: "in", type: "chat", content: "Implementing RBAC in identity: roles, permissions and role checks for RBAC" },
+      { at: t0 + 5 * M, direction: "out", type: "completion", content: "RBAC implementation plan: a roles table and an RBAC filter." },
+      { at: t0 + 10 * M, direction: "out", type: "completion", content: "Added the RBAC filter for admin endpoints." },
+    ]);
+    // …and a recent conversation that mentions it once, in passing, among a lot else.
+    seedSession(srv.dbPath, "s-a2", "identity", idA, [
+      { at: t0 + 9 * 24 * H, direction: "out", type: "completion",
+        content: "Refactored the tenant cache, updated the Dockerfile, bumped Spring Boot, cleaned up logging, renamed the config keys, fixed two flaky tests, and noted that the RBAC implementation from last week is untouched." },
+    ]);
+    // The other repo called identity, and a third project.
+    seedSession(srv.dbPath, "s-b", "identity (IDENTICA360)", idB, [
+      { at: t0 + 2 * H, direction: "out", type: "completion", content: "No RBAC here yet; implementation deferred." },
+    ]);
+    seedSession(srv.dbPath, "s-c", "auth-central", auth2, [
+      { at: t0 + 3 * H, direction: "out", type: "permission_request", content: "Run the Flyway migration\n(writes files)\n$ ./mvnw -o flyway:migrate" },
+      { at: t0 + 3 * H + M, direction: "out", type: "completion", content: "The implementation of token refresh is done." },
+    ]);
+
+    const r1 = await search("rbac implementation");
+    const keys1 = r1.results.map((r: any) => `${r.projectKey}@${r.block.start}`);
+    check("20.1 stemming: 'rbac implementation' finds 'Implementing RBAC…' and 'RBAC implementation…' conversations",
+      keys1.includes(`${idA}@${t0}`) && keys1.includes(`${idB}@${t0 + 2 * H}`), JSON.stringify(r1.results.map((r: any) => r.snippet)));
+    const aOld = r1.results.find((r: any) => r.projectKey === idA && r.block.start === t0);
+    check("20.2 one result per conversation: the two messages with both words in the old identity conversation are one result, '+1 more'",
+      !!aOld && aOld.otherMatches === 1 && aOld.block.title.startsWith("Implementing RBAC") &&
+        r1.results.filter((r: any) => r.projectKey === idA && r.block.start === t0).length === 1, JSON.stringify(aOld));
+    check("20.3 each result says which project by full path, when, and the match in context with highlight markers",
+      aOld?.projectKey === idA && aOld?.at >= t0 && /\u0002[^\u0003]*\u0003/.test(aOld?.snippet ?? ""), JSON.stringify(aOld?.snippet));
+    const pos = (key: string, start: number) => r1.results.findIndex((r: any) => r.projectKey === key && r.block.start === start);
+    check("20.4 ranked by relevance, not recency: the RBAC-heavy conversation ten days ago ranks above last-week's passing mention",
+      pos(idA, t0) !== -1 && pos(idA, t0 + 9 * 24 * H) !== -1 && pos(idA, t0) < pos(idA, t0 + 9 * 24 * H),
+      JSON.stringify(r1.results.map((r: any) => `${r.projectTag}@${new Date(r.block.start).toISOString()} score=${r.score.toFixed(2)}`)));
+    check("20.5 a conversation with only some of the words is a partial match, listed separately, not mixed into results",
+      !r1.results.some((r: any) => r.projectKey === auth2) && (r1.partial ?? []).some((r: any) => r.projectKey === auth2),
+      JSON.stringify({ results: r1.results.length, partial: r1.partial.map((r: any) => r.projectTag) }));
+
+    const scoped = await search("rbac", idA);
+    check("20.6 scoped to one project, only that project's conversations come back — not the other repo called identity",
+      scoped.results.length === 2 && scoped.results.every((r: any) => r.projectKey === idA), JSON.stringify(scoped.results.map((r: any) => r.projectKey)));
+
+    const prefix = await search("flyway migr");
+    const odd = await fetch(`http://localhost:${srv.port}/api/search?q=${encodeURIComponent('"rbac" AND (NOT * OR')}`, auth);
+    const oddBody = await odd.json();
+    check("20.7 the last word matches as you type ('flyway migr'), and FTS syntax in what you type is just text, never an error",
+      prefix.results.length === 1 && prefix.results[0].projectKey === auth2 && odd.status === 200 && Array.isArray(oddBody.results),
+      JSON.stringify({ prefix: prefix.results.map((r: any) => r.snippet), odd: odd.status }));
+
+    // New messages are searchable as they arrive (the index is kept in step by triggers).
+    await stopHook(srv.port, "s-live", projectDir("live-proj"));
+    const c = await Client.open(srv.port, token);
+    await userPromptSubmitHook(srv.port, "s-live", projectDir("live-proj"), "add idempotency keys to the payment webhook");
+    const live = await search("idempotency webhook");
+    check("20.8 a message that just arrived is searchable straight away", live.results.length === 1 && live.results[0].snippet.includes("idempotency"),
+      JSON.stringify(live));
+    c.close();
+
+    const noAuth = await fetch(`http://localhost:${srv.port}/api/search?q=rbac`).then((r) => r.status);
+    check("20.9 search needs the login like everything else", noAuth === 401, `status=${noAuth}`);
+
+    // History from before the index existed is indexed on first start.
+    const raw = new Database(srv.dbPath);
+    raw.exec(`DROP TRIGGER messages_fts_insert; DROP TRIGGER messages_fts_delete; DROP TRIGGER messages_fts_update; DROP TABLE messages_fts;`);
+    raw.prepare(`INSERT INTO messages (session_id, direction, type, content, created_at) VALUES ('s-c', 'out', 'completion', 'Kafka consumer lag is fixed.', ?)`).run(t0 + 4 * H);
+    raw.close();
+    await killServer(srv);
+    srv = await startServer({ port: srv.port, dbPath: srv.dbPath });
+    const backfilled = await search("kafka consumer lag");
+    check("20.10 on first start, messages stored before search existed are indexed too",
+      backfilled.results.length === 1 && backfilled.results[0].projectKey === auth2, JSON.stringify(backfilled));
+  } finally {
+    await killServer(srv);
+  }
+}
+
 // ---------- main ----------
 
 async function main() {
@@ -1609,6 +1818,8 @@ async function main() {
     ["16. Claude's questions are answered, not approved", scenarioQuestions],
     ["17. Seeing and removing queued messages", scenarioQueueControl],
     ["18. Writes stay gated everywhere; cards in plain English", scenarioGatingAndCards],
+    ["19. Per-project history", scenarioProjectHistory],
+    ["20. Search across history", scenarioSearch],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;

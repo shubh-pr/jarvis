@@ -13,7 +13,7 @@ import { registerPendingPermission, cancelPermission } from "../agent/permission
 import { notify } from "../notifier.js";
 import { deriveProjectTag } from "./projectTag.js";
 import { readLastAssistantText } from "./transcript.js";
-import { onTurnEnded, onTurnActivity } from "../agent/router.js";
+import { onTurnEnded, onTurnActivity, isJarvisTurn } from "../agent/router.js";
 import { parseQuestions, questionContent } from "../agent/questions.js";
 import { describeRequest, summaryText } from "../agent/describe.js";
 
@@ -54,8 +54,15 @@ export async function handleUserPromptSubmit(body: any): Promise<object> {
   const cwd = body.cwd;
   const projectTag = resolveProjectTag(sessionId, cwd);
   const existing = getSession(sessionId);
+  // A prompt typed in a terminal is part of the project's history. One Jarvis
+  // sent is already recorded as your message, so it isn't stored twice.
+  const typedInTerminal = !isJarvisTurn(sessionId) && typeof body.prompt === "string" && body.prompt.trim();
   upsertSession(sessionId, projectTag, existing?.status === "starting" ? "starting" : "running", { cwd });
   onTurnActivity(sessionId, projectTag);
+  if (typedInTerminal) {
+    addMessage(sessionId, "in", "prompt", body.prompt.trim());
+    await notify({ sessionId, projectTag, type: "prompt", content: body.prompt.trim() });
+  }
   return {};
 }
 

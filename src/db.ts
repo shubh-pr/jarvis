@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import Database from "better-sqlite3";
 import { config } from "./config.js";
 import type {
@@ -83,6 +84,28 @@ db.exec(`
   );
 `);
 
+// Full-text search over everything said in every project (agent/search.ts).
+// An FTS5 index kept in step with the messages table by triggers; the
+// porter tokenizer stems words, so "implementing" finds "implementation".
+// Built from existing history the first time it's created.
+const hadSearchIndex = db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'`).get() !== undefined;
+db.exec(`
+  CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content, content='messages', content_rowid='id', tokenize='porter unicode61'
+  );
+  CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+  END;
+  CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+  END;
+  CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+  END;
+`);
+if (!hadSearchIndex) db.exec(`INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')`);
+
 const permissionColumns = db.prepare(`PRAGMA table_info(permissions)`).all() as { name: string }[];
 if (!permissionColumns.some((c) => c.name === "questions")) {
   db.exec(`ALTER TABLE permissions ADD COLUMN questions TEXT`);
@@ -112,7 +135,9 @@ export function upsertSession(
        status = @status,
        last_event_at = @now,
        transcript_path = COALESCE(@transcriptPath, transcript_path),
-       cwd = COALESCE(@cwd, cwd)`,
+       -- A session's folder is where it started, fixed at first sight. The cwd
+       -- in later hook calls is wherever Claude's shell has cd'd to since.
+       cwd = COALESCE(cwd, @cwd)`,
   ).run({ id, projectTag, status, now, transcriptPath, cwd });
   return getSession(id) as SessionRecord;
 }
@@ -121,6 +146,33 @@ export function upsertSession(
 // gone, so a session left marked starting is just an ordinary running one.
 export function clearStartingSessions(): number {
   return db.prepare(`UPDATE sessions SET status = 'running' WHERE status = 'starting'`).run().changes;
+}
+
+// Resets any session's stored folder that disagrees with its transcript,
+// which records the folder the session was started in (the first entry's
+// cwd). Sessions stored before folders were fixed at first sight may have
+// drifted to wherever Claude last cd'd. Returns the sessions corrected.
+export function repairSessionFolders(): { id: string; from: string | null; to: string }[] {
+  const rows = db.prepare(`SELECT id, cwd, transcript_path FROM sessions WHERE transcript_path IS NOT NULL`).all() as
+    { id: string; cwd: string | null; transcript_path: string }[];
+  const fixed: { id: string; from: string | null; to: string }[] = [];
+  for (const r of rows) {
+    let first: string | undefined;
+    try {
+      const fd = fs.openSync(r.transcript_path, "r");
+      const buf = Buffer.alloc(64 * 1024);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      fs.closeSync(fd);
+      first = /"cwd":"((?:[^"\\]|\\.)*)"/.exec(buf.toString("utf8", 0, n))?.[1];
+    } catch {
+      continue;
+    }
+    if (first && first !== r.cwd) {
+      db.prepare(`UPDATE sessions SET cwd = ? WHERE id = ?`).run(first, r.id);
+      fixed.push({ id: r.id, from: r.cwd, to: first });
+    }
+  }
+  return fixed;
 }
 
 export function setSessionStatus(id: string, status: SessionStatus): void {

@@ -2,9 +2,8 @@ import type { Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
   isValidAuthToken,
-  listActiveSessions,
-  listMessages,
   listRecentPermissions,
+  getSession,
 } from "./db.js";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -71,6 +70,7 @@ function permissionsSnapshot() {
     items: listRecentPermissions(PERMISSION_SNAPSHOT_WINDOW_MS).map((p) => ({
       toolUseID: p.tool_use_id,
       sessionId: p.session_id,
+      projectKey: getSession(p.session_id)?.cwd ?? undefined,
       projectTag: p.project_tag,
       toolName: p.tool_name,
       status: p.status,
@@ -83,26 +83,6 @@ function permissionsSnapshot() {
 
 export function broadcastPermissions(): void {
   broadcast(permissionsSnapshot());
-}
-
-function historySnapshot() {
-  const messages = [];
-  for (const session of listActiveSessions()) {
-    for (const m of listMessages(session.id)) {
-      messages.push({
-        direction: m.direction,
-        type: m.type,
-        content: m.content,
-        tag: session.project_tag,
-        sessionId: m.session_id,
-        projectTag: session.project_tag,
-        toolUseID: m.tool_use_id ?? undefined,
-        createdAt: m.created_at,
-      });
-    }
-  }
-  messages.sort((a, b) => a.createdAt - b.createdAt);
-  return { type: "history", messages };
 }
 
 function parseInbound(raw: string): InboundMessage | null {
@@ -200,12 +180,10 @@ export function attachWebSocketServer(
       }),
     );
 
-    // Full resync on every connect: the authoritative status of every recent
-    // permission request first — so cards rendered from the backlog never
-    // briefly show live buttons from the client's outdated view — then the
-    // backlog as one snapshot the client replaces rather than appends to.
+    // Resync on every connect: the authoritative status of every recent
+    // permission request (cards read their state from it). Message history
+    // is per project, fetched by the client for the project it's showing.
     ws.send(JSON.stringify(permissionsSnapshot()));
-    ws.send(JSON.stringify(historySnapshot()));
     for (const snapshot of connectSnapshots) ws.send(JSON.stringify(snapshot()));
 
     const reply: Reply = (payload) => {
