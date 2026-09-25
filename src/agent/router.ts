@@ -12,6 +12,8 @@ import {
   findLaunchableCwd,
   registerProject,
   addMessage,
+  editMessage,
+  deleteMessage,
   getPermission,
   hasRecentDeadPermission,
 } from "../db.js";
@@ -66,9 +68,11 @@ function tell(reply: Reply, content: string, extra: Record<string, unknown> = {}
 // `id` is optional: a message about a project that doesn't have a session
 // yet (e.g. "open <project>" before SessionStart has fired) still needs its
 // projectTag shown, but there's nothing to persist it against yet.
-function echoUser(text: string, session?: { id?: string; projectTag: string }, type: "chat" | "permission_decision" = "chat"): void {
-  if (session?.id) addMessage(session.id, "in", type, text);
+// Returns the stored message's ID, when it was stored.
+function echoUser(text: string, session?: { id?: string; projectTag: string }, type: "chat" | "permission_decision" = "chat"): number | undefined {
+  const stored = session?.id ? addMessage(session.id, "in", type, text) : undefined;
   broadcast({
+    id: stored?.id,
     direction: "in",
     type,
     content: text,
@@ -77,6 +81,7 @@ function echoUser(text: string, session?: { id?: string; projectTag: string }, t
     projectTag: session?.projectTag,
     projectKey: session?.id ? getSession(session.id)?.cwd ?? undefined : undefined,
   });
+  return stored?.id;
 }
 
 // ---- Turn tracking ----
@@ -108,6 +113,7 @@ interface QueuedItem {
   id: string;
   text: string;
   at: number;
+  messageId?: number; // your message in the history, kept in step with edits
 }
 const texts = (e: Busy) => e.queued.map((q) => q.text);
 
@@ -116,7 +122,11 @@ function queueSnapshot() {
     type: "queue",
     sessions: [...busy.entries()]
       .filter(([, e]) => e.queued.length)
-      .map(([sessionId, e]) => ({ sessionId, projectTag: e.tag, items: e.queued.map(({ id, text, at }) => ({ id, text, at })) })),
+      .map(([sessionId, e]) => ({
+        sessionId,
+        projectTag: e.tag,
+        items: e.queued.map(({ id, text, at, messageId }) => ({ id, text, at, messageId })),
+      })),
   };
 }
 
@@ -209,10 +219,10 @@ function spawnFresh(tag: string, cwd: string, instruction: string): string {
 }
 
 // Sends a turn into a session, or queues it if a turn is in progress.
-function deliver(session: SessionRecord, text: string): "sent" | "queued" {
+function deliver(session: SessionRecord, text: string, messageId?: number): "sent" | "queued" {
   const entry = busy.get(session.id);
   if (entry) {
-    entry.queued.push({ id: randomUUID(), text, at: Date.now() });
+    entry.queued.push({ id: randomUUID(), text, at: Date.now(), messageId });
     broadcastQueue();
     say(
       entry.kind === "launch"
@@ -281,12 +291,40 @@ function handleUnqueue(msg: Extract<InboundMessage, { type: "unqueue" }>, ack: A
     const i = entry.queued.findIndex((q) => q.id === msg.queueItemId);
     if (i === -1) continue;
     const [removed] = entry.queued.splice(i, 1);
+    // Claude never saw it, so it leaves the history too.
+    if (removed.messageId) {
+      deleteMessage(removed.messageId);
+      broadcast({ type: "message_removed", id: removed.messageId });
+    }
     broadcastQueue();
     say(`Removed from ${entry.tag}'s queue — it won't be sent: "${removed.text}"`);
     ack(true, { action: "unqueued", sessionId, queueItemId: removed.id });
     return;
   }
   refuse("stale", "That message isn't waiting any more — it was already sent (or removed), so there's nothing to cancel.");
+}
+
+// Rewrites a queued message before it sends — the one kind of sent message
+// that hasn't been acted on. Anything already in a Claude turn is refused.
+function handleEditQueued(msg: Extract<InboundMessage, { type: "edit_queued" }>, ack: Ack, refuse: Refuse): void {
+  const text = msg.text.trim();
+  if (!text) {
+    refuse("needs_instruction", "An edited message can't be empty — use ✕ to remove it instead.");
+    return;
+  }
+  for (const [sessionId, entry] of busy) {
+    const item = entry.queued.find((q) => q.id === msg.queueItemId);
+    if (!item) continue;
+    item.text = text;
+    if (item.messageId) {
+      editMessage(item.messageId, text);
+      broadcast({ type: "message_updated", id: item.messageId, content: text, editedAt: Date.now() });
+    }
+    broadcastQueue();
+    ack(true, { action: "edited", sessionId, queueItemId: item.id });
+    return;
+  }
+  refuse("stale", "That message has already been sent to Claude, so it can't be changed now.");
 }
 
 // "send now [project]": deliver a quiet session's waiting messages anyway.
@@ -449,6 +487,8 @@ export async function handleInbound(msg: InboundMessage, reply: Reply): Promise<
       handleAnswer(msg, ack, refuse);
     } else if (msg.type === "unqueue") {
       handleUnqueue(msg, ack, refuse);
+    } else if (msg.type === "edit_queued") {
+      handleEditQueued(msg, ack, refuse);
     } else {
       handleChat(msg, ack, refuse);
     }
@@ -682,8 +722,8 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
     return;
   }
 
-  echoUser(text, { id: session.id, projectTag: session.project_tag });
-  const outcome = deliver(session, text);
+  const messageId = echoUser(text, { id: session.id, projectTag: session.project_tag });
+  const outcome = deliver(session, text, messageId);
   ack(true, { action: outcome === "queued" ? "queued" : "instructed", sessionId: session.id });
 }
 
@@ -821,7 +861,7 @@ function openProject(tag: string, instruction: string, text: string, active: Ses
   // A session that's still starting counts as open: it's never launched twice,
   // and a message for a busy session waits for its turn to end.
   if (existingSession) {
-    echoUser(text, { id: existingSession.id, projectTag: tag });
+    const messageId = echoUser(text, { id: existingSession.id, projectTag: tag });
     if (!instruction) {
       const b = busy.get(existingSession.id);
       const stillStarting = b?.kind === "launch";
@@ -835,7 +875,7 @@ function openProject(tag: string, instruction: string, text: string, active: Ses
       ack(true, { action: stillStarting ? "starting" : "already_open", sessionId: existingSession.id });
       return;
     }
-    const outcome = deliver(existingSession, instruction);
+    const outcome = deliver(existingSession, instruction, messageId);
     ack(true, { action: outcome === "queued" ? "queued" : "instructed", sessionId: existingSession.id });
     return;
   }

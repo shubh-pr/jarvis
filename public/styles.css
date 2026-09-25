@@ -443,3 +443,25 @@ header button { white-space: nowrap; }
 .search-result-snippet mark { background: rgba(56, 189, 248, 0.28); color: var(--text); border-radius: 3px; padding: 0 2px; }
 .search-result-more { font-size: 0.72rem; color: var(--accent); }
 .msg.found { outline: 2px solid var(--accent); outline-offset: 2px; transition: outline-color 0.4s; }
+
+/* ---- your messages: state and editing ---- */
+.msg-state { margin-top: 6px; font-size: 0.7rem; opacity: 0.75; }
+.msg-state button { border: none; background: transparent; color: inherit; font: inherit; text-decoration: underline; cursor: pointer; padding: 0; font-weight: 600; }
+.msg.mine.edited .msg-tag::after { content: " · edited"; }
+.msg-editor { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.msg-editor textarea { flex-basis: 100%; }
+.msg-editor textarea { width: 100%; border-radius: 8px; border: 1px solid rgba(4, 33, 47, 0.3); padding: 8px; font: inherit; resize: vertical; }
+.msg-editor button { align-self: flex-start; border: none; border-radius: 8px; padding: 5px 12px; font-weight: 600; cursor: pointer; }
+.msg-editor button:first-of-type { background: #04212f; color: var(--accent); }
+.queue-edit { border: none; background: transparent; color: var(--accent); font-size: 0.95rem; cursor: pointer; padding: 0 4px; }
+
+/* ---- voice input ---- */
+#composer #mic-btn { padding: 0 12px; border-radius: 10px; border: 1px solid var(--surface-2); background: var(--surface); color: var(--text); font-size: 1.1rem; cursor: pointer; }
+#composer #mic-btn.listening { background: rgba(248, 113, 113, 0.2); border-color: var(--danger); animation: mic-pulse 1.2s ease-in-out infinite; }
+@keyframes mic-pulse { 50% { box-shadow: 0 0 0 4px rgba(248, 113, 113, 0.25); } }
+#mic-note { padding: 6px 14px; font-size: 0.75rem; color: var(--text-dim); border-top: 1px solid var(--surface-2); }
+
+/* compact header: search as an icon, connection as a dot */
+#search-btn { font-size: 0.95rem; padding: 3px 9px; }
+#conn-status { font-size: 0; width: 10px; height: 10px; padding: 0; border-radius: 50%; background: var(--danger); }
+#conn-status.connected { background: var(--ok); }

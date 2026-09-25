@@ -31,6 +31,7 @@ export interface HistoryMessage {
   content: string;
   toolUseID?: string;
   createdAt: number;
+  editedAt?: number;
 }
 
 export interface HistoryBlock {
@@ -70,13 +71,14 @@ export function projectMessages(key: string, from = 0, to = Number.MAX_SAFE_INTE
     db
       .prepare(
         `SELECT m.id, m.session_id AS sessionId, s.cwd AS projectKey, s.project_tag AS projectTag,
-                m.direction, m.type, m.content, m.tool_use_id AS toolUseID, m.created_at AS createdAt
+                m.direction, m.type, m.content, m.tool_use_id AS toolUseID, m.created_at AS createdAt,
+                m.edited_at AS editedAt
            FROM messages m JOIN sessions s ON s.id = m.session_id
           WHERE s.cwd = ? AND m.created_at BETWEEN ? AND ?
           ORDER BY m.created_at, m.id`,
       )
-      .all(key, from, to) as (HistoryMessage & { toolUseID: string | null })[]
-  ).map((m) => ({ ...m, toolUseID: m.toolUseID ?? undefined }));
+      .all(key, from, to) as (HistoryMessage & { toolUseID: string | null; editedAt: number | null })[]
+  ).map((m) => ({ ...m, toolUseID: m.toolUseID ?? undefined, editedAt: m.editedAt ?? undefined }));
 }
 
 function firstLine(text: string, max = 70): string {

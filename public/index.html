@@ -30,7 +30,7 @@
           </div>
         </div>
         <div style="display:flex; align-items:center; gap:8px;">
-          <button id="search-btn" aria-label="Search history">Search</button>
+          <button id="search-btn" aria-label="Search history" title="Search history">🔍</button>
           <button id="history-btn" class="hidden">History</button>
           <button id="enable-push-btn" class="hidden" title="Enable notifications">Notify</button>
           <span id="conn-status" class="disconnected">connecting…</span>
@@ -60,7 +60,9 @@
         <span id="reply-target-label"></span>
         <button id="reply-target-clear" aria-label="Clear reply target">✕</button>
       </div>
+      <div id="mic-note" class="hidden"></div>
       <div id="composer">
+        <button id="mic-btn" aria-label="Speak instead of typing">🎤</button>
         <input id="msg-input" type="text" placeholder="Message…" autocomplete="off" />
         <button id="send-btn">Send</button>
       </div>

@@ -24,6 +24,8 @@ const backBtn = document.getElementById("back-btn");
 const historyBtn = document.getElementById("history-btn");
 const viewTitle = document.getElementById("view-title");
 const viewSub = document.getElementById("view-sub");
+const micBtn = document.getElementById("mic-btn");
+const micNote = document.getElementById("mic-note");
 const searchBtn = document.getElementById("search-btn");
 const searchPanel = document.getElementById("search-panel");
 const searchInput = document.getElementById("search-input");
@@ -347,7 +349,7 @@ function renderSummary(div, summary) {
   }
 }
 
-function appendMessage({ id, direction, type, content, tag, projectTag, toolUseID, sessionId, choiceId, choices, createdAt }, container = messagesEl) {
+function appendMessage({ id, direction, type, content, tag, projectTag, toolUseID, sessionId, choiceId, choices, createdAt, editedAt }, container = messagesEl) {
   const div = document.createElement("div");
   if (id) div.dataset.id = String(id);
   const cls = type === "system" ? "system" : direction === "in" ? "in" : "out";
@@ -369,7 +371,17 @@ function appendMessage({ id, direction, type, content, tag, projectTag, toolUseI
   // Cards show their request structured — the question, or the plain-English
   // gist — instead of the raw text.
   if (summary) renderSummary(div, summary);
-  else if (!questions) div.appendChild(document.createTextNode(content));
+  else if (!questions) {
+    const text = document.createElement("span");
+    text.className = "msg-text";
+    text.textContent = content;
+    div.appendChild(text);
+  }
+  if (editedAt) div.classList.add("edited");
+  if (cls === "in" && type === "chat") {
+    div.classList.add("mine");
+    if (!id) div.classList.add("not-stored");
+  }
   if (type === "permission_request" && toolUseID) {
     div.classList.add("perm");
     if (questions) buildQuestionCard(div, toolUseID, questions);
@@ -385,12 +397,90 @@ function appendMessage({ id, direction, type, content, tag, projectTag, toolUseI
     setReplyTarget(sessionId, projectTag);
   }
   container.appendChild(div);
+  if (div.classList.contains("mine")) renderMessageState(div);
   container.scrollTop = container.scrollHeight;
+}
+
+// ---- Your messages: their state, and editing ones not sent yet ----
+// Only a queued message — waiting for a busy session — hasn't been acted on,
+// so only it can be edited or removed. One already sent is in a Claude turn
+// and stays as it was; one that was refused was never stored.
+const queuedByMessage = new Map(); // history message id -> queue item
+
+function renderMessageState(div) {
+  div.querySelector(".msg-state")?.remove();
+  const state = document.createElement("div");
+  state.className = "msg-state";
+  const item = div.dataset.id ? queuedByMessage.get(Number(div.dataset.id)) : undefined;
+  if (div.classList.contains("not-stored")) {
+    state.textContent = "Not sent to Claude";
+  } else if (item) {
+    state.append("Waiting to send · ");
+    const editBtn = document.createElement("button");
+    editBtn.textContent = "Edit";
+    editBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      startEdit(div, item);
+    });
+    const removeBtn = document.createElement("button");
+    removeBtn.textContent = "Remove";
+    removeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (sendInbound({ type: "unqueue", queueItemId: item.id })) removeBtn.disabled = true;
+    });
+    state.append(editBtn, " · ", removeBtn);
+  } else {
+    state.textContent = "Sent to Claude";
+  }
+  div.appendChild(state);
+}
+
+function renderAllMessageStates() {
+  for (const div of messagesEl.querySelectorAll(".msg.mine")) {
+    if (!div.querySelector(".msg-editor")) renderMessageState(div);
+  }
+}
+
+function startEdit(div, item) {
+  const textEl = div.querySelector(".msg-text");
+  div.querySelector(".msg-state")?.remove();
+  const editor = document.createElement("div");
+  editor.className = "msg-editor";
+  const area = document.createElement("textarea");
+  area.value = item.text;
+  area.rows = Math.min(6, Math.max(2, Math.ceil(item.text.length / 36)));
+  const save = document.createElement("button");
+  save.textContent = "Save";
+  const cancel = document.createElement("button");
+  cancel.textContent = "Cancel";
+  const done = () => {
+    editor.remove();
+    textEl.classList.remove("hidden");
+    renderMessageState(div);
+  };
+  cancel.addEventListener("click", (e) => {
+    e.stopPropagation();
+    done();
+  });
+  save.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const text = area.value.trim();
+    if (!text || !sendInbound({ type: "edit_queued", queueItemId: item.id, text })) return;
+    done();
+  });
+  area.addEventListener("click", (e) => e.stopPropagation());
+  editor.append(area, save, cancel);
+  textEl.classList.add("hidden");
+  div.appendChild(editor);
+  area.focus();
 }
 
 // Messages waiting for a busy session, straight from the server's queue —
 // exactly what will be sent when the session is free. ✕ takes one back.
 function renderQueue(sessions) {
+  queuedByMessage.clear();
+  for (const s of sessions) for (const item of s.items) if (item.messageId) queuedByMessage.set(item.messageId, item);
+  renderAllMessageStates();
   queuePanel.replaceChildren();
   queuePanel.classList.toggle("hidden", !sessions.length);
   for (const s of sessions) {
@@ -411,7 +501,21 @@ function renderQueue(sessions) {
       remove.addEventListener("click", () => {
         if (sendInbound({ type: "unqueue", queueItemId: item.id })) remove.disabled = true;
       });
-      row.append(text, remove);
+      const edit = document.createElement("button");
+      edit.className = "queue-edit";
+      edit.textContent = "✎";
+      edit.setAttribute("aria-label", "Edit before it sends");
+      edit.addEventListener("click", () => {
+        const bubble = item.messageId && messagesEl.querySelector(`[data-id="${item.messageId}"]`);
+        if (bubble) {
+          startEdit(bubble, item);
+          bubble.scrollIntoView({ block: "center" });
+          return;
+        }
+        const next = window.prompt("Edit before it sends:", item.text);
+        if (next && next.trim()) sendInbound({ type: "edit_queued", queueItemId: item.id, text: next.trim() });
+      });
+      row.append(text, edit, remove);
       queuePanel.appendChild(row);
     }
   }
@@ -842,6 +946,17 @@ function handleServerMessage(msg) {
     renderQueue(msg.sessions);
     return;
   }
+  if (msg.type === "message_updated") {
+    const div = messagesEl.querySelector(`[data-id="${msg.id}"]`);
+    const textEl = div?.querySelector(".msg-text");
+    if (textEl) textEl.textContent = msg.content;
+    div?.classList.add("edited");
+    return;
+  }
+  if (msg.type === "message_removed") {
+    messagesEl.querySelector(`[data-id="${msg.id}"]`)?.remove();
+    return;
+  }
   if (msg.type === "permissions") {
     permissions.clear();
     for (const item of msg.items) permissions.set(item.toolUseID, item);
@@ -923,6 +1038,7 @@ function connect() {
     showChat();
     connStatus.textContent = "connected";
     connStatus.className = "connected";
+    connStatus.title = "Connected";
     reconnectDelay = 1000;
     // Reconnecting keeps you where you were; a notification's link
     // (?project=…) opens that project.
@@ -947,6 +1063,7 @@ function connect() {
   ws.onclose = (event) => {
     connStatus.textContent = "disconnected";
     connStatus.className = "disconnected";
+    connStatus.title = "Disconnected — reconnecting";
     if (event.code === 4401) {
       clearToken();
       showLogin("Session expired, please log in again.");
@@ -1003,6 +1120,69 @@ function sendMessage() {
 }
 
 sendBtn.addEventListener("click", sendMessage);
+
+// ---- Voice input ----
+// The browser's own speech recognition fills the message box for you to
+// review; it never sends. Where the browser lacks it or refuses, say so
+// plainly — including the error it gave — rather than failing silently.
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const MIC_ERRORS = {
+  "not-allowed": "Microphone access was refused. Allow it for this site in your browser settings, then try again.",
+  "service-not-allowed": "This browser won't run speech recognition here (common in iPhone home-screen apps). Use the 🎤 key on your keyboard instead.",
+  "no-speech": "Didn't hear anything — tap the mic and speak.",
+  "audio-capture": "No microphone was found.",
+  network: "Speech recognition couldn't reach the browser's speech service. Check your connection, or use your keyboard's dictation.",
+  "language-not-supported": "Speech recognition doesn't support this language here.",
+};
+let recognizer = null;
+let micNoteTimer = null;
+
+function showMicNote(text) {
+  micNote.textContent = text;
+  micNote.classList.remove("hidden");
+  clearTimeout(micNoteTimer);
+  micNoteTimer = setTimeout(() => micNote.classList.add("hidden"), 8000);
+}
+
+micBtn.addEventListener("click", () => {
+  if (!Recognition) {
+    showMicNote("Voice input isn't available in this browser. On iPhone, use the 🎤 key on your keyboard instead — it works in this box too.");
+    return;
+  }
+  if (recognizer) {
+    recognizer.stop();
+    return;
+  }
+  const r = new Recognition();
+  recognizer = r;
+  r.lang = navigator.language || "en-US";
+  r.interimResults = true;
+  r.continuous = false;
+  const before = msgInput.value ? `${msgInput.value.trimEnd()} ` : "";
+  r.onresult = (e) => {
+    let heard = "";
+    for (const result of e.results) heard += result[0].transcript;
+    msgInput.value = before + heard; // into the box only — sending is always your tap
+  };
+  r.onerror = (e) => {
+    if (e.error !== "aborted") showMicNote(MIC_ERRORS[e.error] ?? `Voice input stopped (${e.error}).`);
+  };
+  r.onend = () => {
+    recognizer = null;
+    micBtn.classList.remove("listening");
+    micBtn.setAttribute("aria-label", "Speak instead of typing");
+    msgInput.focus();
+  };
+  try {
+    r.start();
+    micBtn.classList.add("listening");
+    micBtn.setAttribute("aria-label", "Stop listening");
+    showMicNote("Listening… tap the mic again to stop. Nothing sends until you tap Send.");
+  } catch (err) {
+    recognizer = null;
+    showMicNote(`Voice input couldn't start (${err.message}).`);
+  }
+});
 msgInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendMessage();
 });

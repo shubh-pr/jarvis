@@ -1795,6 +1795,79 @@ async function scenarioSearch() {
   }
 }
 
+async function scenarioEditQueued() {
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const cwd = projectDir("edit-svc");
+    const to = { sessionId: "edit-session", changedMsAgo: 5000 };
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const history = () => fetch(`http://localhost:${srv.port}/api/projects/messages?key=${encodeURIComponent(cwd)}`, auth).then((r) => r.json()).then((j) => j.messages);
+    const queued = () => (c.latest((e) => e.type === "queue")?.sessions ?? []).find((s: any) => s.sessionId === "edit-session")?.items ?? [];
+
+    await stopHook(srv.port, "edit-session", cwd);
+    await userPromptSubmitHook(srv.port, "edit-session", cwd, "terminal turn"); // busy
+    const ack1 = await c.request({ type: "chat", content: "add rate limiting to the login endpoint", replyToSession: to });
+    await sleep(200);
+    const item = queued()[0];
+    const echo = c.latest((e) => e.type === "chat" && e.direction === "in" && e.content === "add rate limiting to the login endpoint");
+    check("21.1 a queued message is linked to its entry in the history (so the two can't drift apart)",
+      ack1?.action === "queued" && !!item?.messageId && echo?.id === item.messageId &&
+        (await history()).some((m: any) => m.id === item.messageId && m.content === "add rate limiting to the login endpoint"),
+      `item=${JSON.stringify(item)}; echo id=${echo?.id}`);
+
+    const ack2 = await c.request({ type: "edit_queued", queueItemId: item.id, text: "add rate limiting to the login and signup endpoints" });
+    await sleep(200);
+    const upd = c.latest((e) => e.type === "message_updated" && e.id === item.messageId);
+    const h2 = (await history()).find((m: any) => m.id === item.messageId);
+    check("21.2 editing a queued message changes what will be sent, the history entry (marked edited), and tells the client",
+      ack2?.action === "edited" && queued()[0]?.text === "add rate limiting to the login and signup endpoints" &&
+        h2?.content === "add rate limiting to the login and signup endpoints" && !!h2?.editedAt && upd?.content === h2?.content,
+      `${describeAck(ack2)}; history=${JSON.stringify(h2)}`);
+
+    const s1 = await fetch(`http://localhost:${srv.port}/api/search?q=${encodeURIComponent("signup endpoints")}`, auth).then((r) => r.json());
+    check("21.3 search finds the edited text", s1.results.length === 1, JSON.stringify(s1.results.map((r: any) => r.snippet)));
+
+    const empty = await c.request({ type: "edit_queued", queueItemId: item.id, text: "   " });
+    check("21.4 an edit can't empty a message (remove it instead)", empty?.ok === false && queued()[0]?.text.includes("signup"), describeAck(empty));
+
+    await stopHook(srv.port, "edit-session", cwd); // the terminal turn ends: the edited text goes in
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv = claudeInvocations();
+    check("21.5 when the session is free, the edited text is what's sent",
+      inv.length === 1 && inv[0].includes("login and signup endpoints"), `claude invoked: ${JSON.stringify(inv)}`);
+
+    const late = await c.request({ type: "edit_queued", queueItemId: item.id, text: "too late" });
+    const h5 = (await history()).find((m: any) => m.id === item.messageId);
+    check("21.6 once it's in a Claude turn it can't be edited — refused, and the history keeps what was actually sent",
+      late?.ok === false && late?.reason === "stale" && h5?.content.includes("signup") && !h5?.content.includes("too late"),
+      `${describeAck(late)}; history=${JSON.stringify(h5?.content)}`);
+
+    // Removing a queued message takes it out of the history too — Claude never saw it.
+    await stopHook(srv.port, "edit-session", cwd); // the delivered turn ends
+    await userPromptSubmitHook(srv.port, "edit-session", cwd, "another terminal turn");
+    await c.request({ type: "chat", content: "never mind, drop the cache", replyToSession: to });
+    await sleep(200);
+    const drop = queued()[0];
+    await c.request({ type: "unqueue", queueItemId: drop.id });
+    await sleep(200);
+    const gone = c.latest((e) => e.type === "message_removed" && e.id === drop.messageId);
+    const h7 = await history();
+    const s2 = await fetch(`http://localhost:${srv.port}/api/search?q=${encodeURIComponent("drop the cache")}`, auth).then((r) => r.json());
+    check("21.7 removing a queued message removes its history entry (and search hit) and tells the client",
+      !!gone && !h7.some((m: any) => m.id === drop.messageId) && s2.results.length === 0,
+      `removed event=${!!gone}; still in history=${h7.some((m: any) => m.id === drop.messageId)}; search=${s2.results.length}`);
+
+    const sentIds = h7.filter((m: any) => m.direction === "in" && m.type === "chat").map((m: any) => m.id);
+    check("21.8 messages already sent to Claude stay in the history unchanged", sentIds.includes(item.messageId), JSON.stringify(sentIds));
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
 // ---------- main ----------
 
 async function main() {
@@ -1820,6 +1893,7 @@ async function main() {
     ["18. Writes stay gated everywhere; cards in plain English", scenarioGatingAndCards],
     ["19. Per-project history", scenarioProjectHistory],
     ["20. Search across history", scenarioSearch],
+    ["21. Editing and removing queued messages", scenarioEditQueued],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;

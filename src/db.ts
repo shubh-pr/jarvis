@@ -106,6 +106,10 @@ db.exec(`
 `);
 if (!hadSearchIndex) db.exec(`INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')`);
 
+if (!(db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[]).some((c) => c.name === "edited_at")) {
+  db.exec(`ALTER TABLE messages ADD COLUMN edited_at INTEGER`);
+}
+
 const permissionColumns = db.prepare(`PRAGMA table_info(permissions)`).all() as { name: string }[];
 if (!permissionColumns.some((c) => c.name === "questions")) {
   db.exec(`ALTER TABLE permissions ADD COLUMN questions TEXT`);
@@ -224,6 +228,17 @@ export function addMessage(
     created_at: now,
     tool_use_id: toolUseId,
   };
+}
+
+// Only for a queued message you edit before it's sent (the history then
+// matches what Claude receives). Sent messages are never changed.
+export function editMessage(id: number, content: string): void {
+  db.prepare(`UPDATE messages SET content = ?, edited_at = ? WHERE id = ?`).run(content, Date.now(), id);
+}
+
+// Only for a queued message you remove before it's sent: Claude never saw it.
+export function deleteMessage(id: number): void {
+  db.prepare(`DELETE FROM messages WHERE id = ?`).run(id);
 }
 
 export function getLastMessageContent(

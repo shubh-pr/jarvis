@@ -27,6 +27,7 @@ export type InboundMessage =
     }
   | { type: "answer"; clientId?: string; toolUseID: string; answers: unknown }
   | { type: "unqueue"; clientId?: string; queueItemId: string }
+  | { type: "edit_queued"; clientId?: string; queueItemId: string; text: string }
   | {
       type: "chat";
       clientId?: string;
@@ -99,6 +100,10 @@ function parseInbound(raw: string): InboundMessage | null {
       message: typeof parsed.message === "string" ? parsed.message : undefined,
       answerInTerminal: parsed.answerInTerminal === true,
     };
+  }
+  if (parsed.type === "edit_queued") {
+    if (typeof parsed.queueItemId !== "string" || typeof parsed.text !== "string") return null;
+    return { type: "edit_queued", clientId, queueItemId: parsed.queueItemId, text: parsed.text };
   }
   if (parsed.type === "unqueue") {
     if (typeof parsed.queueItemId !== "string") return null;
