@@ -2,6 +2,9 @@ import type { PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import { setSessionStatus, insertPermission, finishPermission, getPermission } from "../db.js";
 import { notify } from "../notifier.js";
 import { broadcastPermissions } from "../wsServer.js";
+import type { Question } from "../types.js";
+import type { Answers } from "./questions.js";
+import type { RequestSummary } from "./describe.js";
 
 const IDLE_NUDGE_MS = 120_000;
 
@@ -10,6 +13,8 @@ interface PendingPermission {
   projectTag: string;
   toolName: string;
   input: Record<string, unknown>;
+  questions?: Question[]; // set for AskUserQuestion: needs an answer, not a yes/no
+  summary?: RequestSummary; // the plain-English gist shown on the card
   requestedAt: number;
   resolve: (result: PermissionResult | null) => void;
   nudgeTimer: ReturnType<typeof setInterval>;
@@ -36,6 +41,8 @@ export function registerPendingPermission(
     tool_name: entry.toolName,
     content: entry.content,
     created_at: requestedAt,
+    questions: entry.questions ? JSON.stringify(entry.questions) : null,
+    summary: entry.summary ? JSON.stringify(entry.summary) : null,
   });
 
   const nudgeTimer = setInterval(() => {
@@ -43,7 +50,9 @@ export function registerPendingPermission(
       sessionId: entry.sessionId,
       projectTag: entry.projectTag,
       type: "idle_nudge",
-      content: `Still waiting on your reply for ${entry.toolName}. Reply YES/NO or give new instructions.`,
+      content: entry.questions
+        ? `Claude is still waiting for your answer: ${entry.questions[0].question}`
+        : `Still waiting on you: ${entry.summary?.title ?? entry.toolName}`,
       toolUseID,
     });
   }, IDLE_NUDGE_MS);
@@ -52,6 +61,7 @@ export function registerPendingPermission(
     projectTag: entry.projectTag,
     toolName: entry.toolName,
     input: entry.input,
+    questions: entry.questions,
     resolve: entry.resolve,
     requestedAt,
     nudgeTimer,
@@ -59,20 +69,23 @@ export function registerPendingPermission(
   broadcastPermissions();
 }
 
+// `answers` completes an AskUserQuestion: it's allowed with the answers in
+// its input, which is how Claude receives them.
 export function resolvePermission(
   toolUseID: string,
   decision: "allow" | "deny",
   message?: string,
   interrupt?: boolean,
+  answers?: Answers,
 ): ResolveOutcome {
   const p = pending.get(toolUseID);
   if (!p) return { ok: false, reason: getPermission(toolUseID) ? "stale" : "unknown" };
   clearInterval(p.nudgeTimer);
   pending.delete(toolUseID);
-  finishPermission(toolUseID, decision === "allow" ? "allowed" : "denied");
+  finishPermission(toolUseID, decision === "deny" ? "denied" : answers ? "answered" : "allowed");
   setSessionStatus(p.sessionId, "running");
   if (decision === "allow") {
-    p.resolve({ behavior: "allow", updatedInput: p.input });
+    p.resolve({ behavior: "allow", updatedInput: answers ? { ...p.input, answers } : p.input });
   } else {
     p.resolve({
       behavior: "deny",
@@ -104,6 +117,7 @@ export function listPendingPermissions() {
     projectTag: p.projectTag,
     toolName: p.toolName,
     input: p.input,
+    questions: p.questions,
     requestedAt: p.requestedAt,
   }));
 }

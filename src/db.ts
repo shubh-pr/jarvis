@@ -83,6 +83,14 @@ db.exec(`
   );
 `);
 
+const permissionColumns = db.prepare(`PRAGMA table_info(permissions)`).all() as { name: string }[];
+if (!permissionColumns.some((c) => c.name === "questions")) {
+  db.exec(`ALTER TABLE permissions ADD COLUMN questions TEXT`);
+}
+if (!permissionColumns.some((c) => c.name === "summary")) {
+  db.exec(`ALTER TABLE permissions ADD COLUMN summary TEXT`);
+}
+
 const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
 if (!messageColumns.some((c) => c.name === "tool_use_id")) {
   db.exec(`ALTER TABLE messages ADD COLUMN tool_use_id TEXT`);
@@ -107,6 +115,12 @@ export function upsertSession(
        cwd = COALESCE(@cwd, cwd)`,
   ).run({ id, projectTag, status, now, transcriptPath, cwd });
   return getSession(id) as SessionRecord;
+}
+
+// The "first turn in progress" state lives in memory; after a restart it's
+// gone, so a session left marked starting is just an ordinary running one.
+export function clearStartingSessions(): number {
+  return db.prepare(`UPDATE sessions SET status = 'running' WHERE status = 'starting'`).run().changes;
 }
 
 export function setSessionStatus(id: string, status: SessionStatus): void {
@@ -214,11 +228,13 @@ export function isValidAuthToken(token: string): boolean {
   );
 }
 
-export function insertPermission(p: Omit<PermissionRecord, "status" | "resolved_at">): void {
+export function insertPermission(
+  p: Omit<PermissionRecord, "status" | "resolved_at" | "questions" | "summary"> & { questions?: string | null; summary?: string | null },
+): void {
   db.prepare(
-    `INSERT INTO permissions (tool_use_id, session_id, project_tag, tool_name, content, status, created_at)
-     VALUES (@tool_use_id, @session_id, @project_tag, @tool_name, @content, 'pending', @created_at)`,
-  ).run(p);
+    `INSERT INTO permissions (tool_use_id, session_id, project_tag, tool_name, content, status, created_at, questions, summary)
+     VALUES (@tool_use_id, @session_id, @project_tag, @tool_name, @content, 'pending', @created_at, @questions, @summary)`,
+  ).run({ ...p, questions: p.questions ?? null, summary: p.summary ?? null });
 }
 
 // Only moves a request out of 'pending' — a terminal status is never

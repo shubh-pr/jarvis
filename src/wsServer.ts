@@ -17,7 +17,17 @@ interface TrackedSocket extends WebSocket {
 }
 
 export type InboundMessage =
-  | { type: "decision"; clientId?: string; toolUseID: string; decision: "allow" | "deny"; message?: string }
+  | {
+      type: "decision";
+      clientId?: string;
+      toolUseID: string;
+      decision: "allow" | "deny";
+      message?: string;
+      // For a question: pass it to the terminal unanswered, deliberately.
+      answerInTerminal?: boolean;
+    }
+  | { type: "answer"; clientId?: string; toolUseID: string; answers: unknown }
+  | { type: "unqueue"; clientId?: string; queueItemId: string }
   | {
       type: "chat";
       clientId?: string;
@@ -33,6 +43,13 @@ export type InboundMessage =
 export type Reply = (payload: unknown) => void;
 
 const clients = new Set<TrackedSocket>();
+
+// Other state a client needs on connect (e.g. the message queue), registered
+// by the module that owns it so this one doesn't have to import it.
+const connectSnapshots: (() => unknown)[] = [];
+export function registerConnectSnapshot(fn: () => unknown): void {
+  connectSnapshots.push(fn);
+}
 
 export function broadcast(payload: unknown): void {
   const data = JSON.stringify(payload);
@@ -58,6 +75,8 @@ function permissionsSnapshot() {
       toolName: p.tool_name,
       status: p.status,
       createdAt: p.created_at,
+      questions: p.questions ? JSON.parse(p.questions) : undefined,
+      summary: p.summary ? JSON.parse(p.summary) : undefined,
     })),
   };
 }
@@ -98,7 +117,16 @@ function parseInbound(raw: string): InboundMessage | null {
       toolUseID: parsed.toolUseID,
       decision: parsed.decision,
       message: typeof parsed.message === "string" ? parsed.message : undefined,
+      answerInTerminal: parsed.answerInTerminal === true,
     };
+  }
+  if (parsed.type === "unqueue") {
+    if (typeof parsed.queueItemId !== "string") return null;
+    return { type: "unqueue", clientId, queueItemId: parsed.queueItemId };
+  }
+  if (parsed.type === "answer") {
+    if (typeof parsed.toolUseID !== "string") return null;
+    return { type: "answer", clientId, toolUseID: parsed.toolUseID, answers: parsed.answers };
   }
   if (typeof parsed.content !== "string" || !parsed.content.trim()) return null;
   return {
@@ -178,6 +206,7 @@ export function attachWebSocketServer(
     // backlog as one snapshot the client replaces rather than appends to.
     ws.send(JSON.stringify(permissionsSnapshot()));
     ws.send(JSON.stringify(historySnapshot()));
+    for (const snapshot of connectSnapshots) ws.send(JSON.stringify(snapshot()));
 
     const reply: Reply = (payload) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));

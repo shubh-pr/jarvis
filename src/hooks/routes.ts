@@ -13,6 +13,9 @@ import { registerPendingPermission, cancelPermission } from "../agent/permission
 import { notify } from "../notifier.js";
 import { deriveProjectTag } from "./projectTag.js";
 import { readLastAssistantText } from "./transcript.js";
+import { onTurnEnded, onTurnActivity } from "../agent/router.js";
+import { parseQuestions, questionContent } from "../agent/questions.js";
+import { describeRequest, summaryText } from "../agent/describe.js";
 
 // A session's display name is fixed the first time we see it, so it can't
 // drift mid-conversation if a later, unrelated session happens to collide.
@@ -44,6 +47,18 @@ export async function handleSessionStart(body: any): Promise<object> {
   return {};
 }
 
+// A prompt was submitted — a turn is starting, in a terminal or anywhere
+// else. Marks the session busy so nothing is sent into it until Stop.
+export async function handleUserPromptSubmit(body: any): Promise<object> {
+  const sessionId = body.session_id;
+  const cwd = body.cwd;
+  const projectTag = resolveProjectTag(sessionId, cwd);
+  const existing = getSession(sessionId);
+  upsertSession(sessionId, projectTag, existing?.status === "starting" ? "starting" : "running", { cwd });
+  onTurnActivity(sessionId, projectTag);
+  return {};
+}
+
 export async function handlePermissionRequest(body: any, connectionClosed: AbortSignal): Promise<object | null> {
   const sessionId = body.session_id;
   const cwd = body.cwd;
@@ -52,9 +67,12 @@ export async function handlePermissionRequest(body: any, connectionClosed: Abort
   const projectTag = resolveProjectTag(sessionId, cwd);
 
   upsertSession(sessionId, projectTag, "waiting_permission", { cwd });
+  onTurnActivity(sessionId, projectTag); // a permission request only ever happens mid-turn
 
   const toolUseID = crypto.randomUUID();
-  const content = `Permission requested: ${toolName}(${JSON.stringify(toolInput)}). Reply YES/NO or give new instructions.`;
+  const questions = parseQuestions(toolName, toolInput);
+  const summary = questions ? undefined : describeRequest(toolName, toolInput, cwd);
+  const content = questions ? questionContent(questions) : summaryText(summary!);
   addMessage(sessionId, "out", "permission_request", content, toolUseID);
 
   const decisionPromise = new Promise<PermissionResult | null>((resolve) => {
@@ -63,6 +81,8 @@ export async function handlePermissionRequest(body: any, connectionClosed: Abort
       projectTag,
       toolName,
       input: toolInput,
+      questions,
+      summary,
       content,
       resolve,
     });
@@ -76,10 +96,13 @@ export async function handlePermissionRequest(body: any, connectionClosed: Abort
   if (!decision) return null; // cancelled — the caller has already gone away
 
   if (decision.behavior === "allow") {
+    // Answers to an AskUserQuestion travel in the tool's input; a plain
+    // approval leaves the input as Claude sent it.
+    const answers = (decision.updatedInput as any)?.answers;
     return {
       hookSpecificOutput: {
         hookEventName: "PermissionRequest",
-        decision: { behavior: "allow" },
+        decision: answers ? { behavior: "allow", updatedInput: decision.updatedInput } : { behavior: "allow" },
       },
     };
   }
@@ -129,5 +152,8 @@ export async function handleStop(body: any): Promise<object> {
   upsertSession(sessionId, projectTag, "waiting_input", { cwd, transcriptPath });
   addMessage(sessionId, "out", "completion", content);
   await notify({ sessionId, projectTag, type: "completion", content });
+  // A session Jarvis launched is ready once its first turn ends; this sends
+  // anything that was queued for it while it was starting.
+  onTurnEnded(sessionId);
   return {};
 }

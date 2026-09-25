@@ -18,4 +18,7 @@ export const config = {
   agentDefaultCwd: process.env.AGENT_DEFAULT_CWD ?? process.cwd(),
   operatorName: process.env.OPERATOR_NAME ?? "Mr. Prakash",
   hooksSecret: required("HOOKS_SECRET", process.env.HOOKS_SECRET),
+  // How long a session with messages waiting for it can be silent before
+  // Jarvis mentions it (an interrupted turn never sends Stop).
+  busyNudgeMs: Number(process.env.BUSY_NUDGE_MS ?? 10 * 60_000),
 };

@@ -281,3 +281,112 @@ header h1 {
 }
 
 .choice-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* ---- question cards (AskUserQuestion) ---- */
+.question-block { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.question-header {
+  align-self: flex-start;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.question-text { font-weight: 600; }
+.question-option {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--surface-2);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+}
+.question-option.chosen { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok) inset; }
+.question-option:disabled { opacity: 0.55; cursor: default; }
+.question-option-label { font-weight: 600; font-size: 0.9rem; }
+.question-option-desc { font-size: 0.8rem; color: var(--text-dim); }
+.question-send {
+  margin-top: 10px;
+  width: 100%;
+  padding: 10px 0;
+  border-radius: 10px;
+  border: none;
+  background: var(--ok);
+  color: #052e14;
+  font-weight: 600;
+  cursor: pointer;
+}
+.question-send:disabled { opacity: 0.45; cursor: default; }
+.question-hint { margin-top: 6px; font-size: 0.75rem; color: var(--text-dim); }
+.question-alt { display: flex; gap: 12px; margin-top: 8px; }
+.question-alt-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+}
+.question-alt-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* ---- waiting-to-send queue ---- */
+#queue-panel {
+  padding: 8px 14px 4px;
+  border-top: 1px solid var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 30vh;
+  overflow-y: auto;
+}
+.queue-title { font-size: 0.72rem; color: var(--text-dim); }
+.queue-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px dashed var(--accent);
+  font-size: 0.85rem;
+}
+.queue-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
+.queue-remove {
+  border: none;
+  background: transparent;
+  color: var(--danger);
+  font-size: 0.95rem;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.queue-remove:disabled { opacity: 0.4; cursor: default; }
+
+/* ---- plain-English permission cards ---- */
+.perm-title { font-weight: 600; font-size: 0.95rem; }
+.perm-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.perm-tag {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+}
+.perm-tag.risky { background: rgba(248, 113, 113, 0.15); color: var(--danger); }
+.perm-detail {
+  margin-top: 7px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.perm-detail.expanded { white-space: pre-wrap; word-break: break-all; }

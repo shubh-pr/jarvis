@@ -1,4 +1,5 @@
 export type SessionStatus =
+  | "starting"
   | "running"
   | "waiting_permission"
   | "waiting_input"
@@ -36,7 +37,20 @@ export interface MessageRecord {
   tool_use_id: string | null;
 }
 
-export type PermissionStatus = "pending" | "allowed" | "denied" | "stale" | "cancelled";
+export type PermissionStatus = "pending" | "allowed" | "answered" | "denied" | "stale" | "cancelled";
+
+// Claude's AskUserQuestion tool input: real multiple-choice questions that
+// need an answer, not a yes/no on whether a command may run.
+export interface QuestionOption {
+  label: string;
+  description?: string;
+}
+export interface Question {
+  question: string;
+  header?: string;
+  options: QuestionOption[];
+  multiSelect?: boolean;
+}
 
 export interface PermissionRecord {
   tool_use_id: string;
@@ -47,6 +61,8 @@ export interface PermissionRecord {
   status: PermissionStatus;
   created_at: number;
   resolved_at: number | null;
+  questions: string | null; // JSON Question[] when this is an AskUserQuestion
+  summary: string | null; // JSON RequestSummary: the plain-English card
 }
 
 export interface ProjectRecord {

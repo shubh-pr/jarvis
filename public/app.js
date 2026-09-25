@@ -10,6 +10,7 @@ const messagesEl = document.getElementById("messages");
 const msgInput = document.getElementById("msg-input");
 const sendBtn = document.getElementById("send-btn");
 const enablePushBtn = document.getElementById("enable-push-btn");
+const queuePanel = document.getElementById("queue-panel");
 const replyTargetEl = document.getElementById("reply-target");
 const replyTargetLabel = document.getElementById("reply-target-label");
 const replyTargetClear = document.getElementById("reply-target-clear");
@@ -51,6 +52,7 @@ const permissions = new Map();
 const permissionCards = new Map();
 
 const STATUS_LABELS = {
+  answered: "Answered",
   allowed: "Approved",
   denied: "Denied",
   cancelled: "Cancelled — no longer waiting",
@@ -115,6 +117,115 @@ function buildPermissionCard(div, toolUseID) {
     if (permissionCards.get(toolUseID)?.actions !== actions) return;
     if (permissions.get(toolUseID)?.status !== "pending") return;
     actions.querySelectorAll("button").forEach((b) => (b.disabled = false));
+  }, CARD_ARM_MS);
+}
+
+// A question from Claude (its AskUserQuestion tool) needs an answer, not an
+// approval: approving it unanswered only moves it to the terminal. So its
+// card shows the real question and options, and sends the chosen answer.
+function buildQuestionCard(div, toolUseID, questions) {
+  const actions = document.createElement("div");
+  actions.className = "question-card";
+  const chosen = questions.map(() => new Set());
+  const sendBtn = document.createElement("button");
+  let armed = false;
+  const refresh = () => {
+    sendBtn.disabled = !armed || chosen.some((c) => c.size === 0);
+  };
+
+  questions.forEach((q, qi) => {
+    const block = document.createElement("div");
+    block.className = "question-block";
+    if (q.header) {
+      const chip = document.createElement("span");
+      chip.className = "question-header";
+      chip.textContent = q.header;
+      block.appendChild(chip);
+    }
+    const text = document.createElement("div");
+    text.className = "question-text";
+    text.textContent = q.question + (q.multiSelect ? " (pick any)" : "");
+    block.appendChild(text);
+    const optionButtons = [];
+    q.options.forEach((o) => {
+      const btn = document.createElement("button");
+      btn.className = "question-option";
+      btn.disabled = true;
+      const label = document.createElement("span");
+      label.className = "question-option-label";
+      label.textContent = o.label;
+      btn.appendChild(label);
+      if (o.description) {
+        const desc = document.createElement("span");
+        desc.className = "question-option-desc";
+        desc.textContent = o.description;
+        btn.appendChild(desc);
+      }
+      btn.addEventListener("click", () => {
+        if (q.multiSelect) {
+          chosen[qi].has(o.label) ? chosen[qi].delete(o.label) : chosen[qi].add(o.label);
+        } else {
+          chosen[qi] = new Set([o.label]);
+        }
+        optionButtons.forEach((b, i) => b.classList.toggle("chosen", chosen[qi].has(q.options[i].label)));
+        refresh();
+      });
+      optionButtons.push(btn);
+      block.appendChild(btn);
+    });
+    actions.appendChild(block);
+  });
+
+  sendBtn.className = "question-send";
+  sendBtn.textContent = "Send answer";
+  sendBtn.disabled = true;
+  sendBtn.addEventListener("click", () => {
+    const answers = {};
+    questions.forEach((q, qi) => {
+      const picked = [...chosen[qi]];
+      answers[q.question] = q.multiSelect ? picked : picked[0];
+    });
+    if (sendInbound({ type: "answer", toolUseID, answers })) {
+      actions.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    }
+  });
+  actions.appendChild(sendBtn);
+
+  if (questions.length === 1) {
+    const hint = document.createElement("div");
+    hint.className = "question-hint";
+    hint.textContent = "Or type your own answer below.";
+    actions.appendChild(hint);
+  }
+  const alt = document.createElement("div");
+  alt.className = "question-alt";
+  for (const [label, msg] of [
+    ["Answer in terminal instead", { type: "decision", toolUseID, decision: "allow", answerInTerminal: true }],
+    ["Dismiss", { type: "decision", toolUseID, decision: "deny" }],
+  ]) {
+    const btn = document.createElement("button");
+    btn.className = "question-alt-btn";
+    btn.textContent = label;
+    btn.disabled = true;
+    btn.addEventListener("click", () => {
+      if (sendInbound(msg)) actions.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    });
+    alt.appendChild(btn);
+  }
+  actions.appendChild(alt);
+
+  const status = document.createElement("div");
+  status.className = "perm-status hidden";
+  div.appendChild(actions);
+  div.appendChild(status);
+  permissionCards.set(toolUseID, { el: div, actions, status });
+  renderCardState(toolUseID);
+  setTimeout(() => {
+    if (permissionCards.get(toolUseID)?.actions !== actions) return;
+    if (permissions.get(toolUseID)?.status !== "pending") return;
+    armed = true;
+    actions.querySelectorAll(".question-option, .question-alt-btn").forEach((b) => (b.disabled = false));
+    refresh();
   }, CARD_ARM_MS);
 }
 
@@ -185,6 +296,39 @@ replyTargetClear.addEventListener("click", () => {
   renderReplyTarget();
 });
 
+// What a permission request wants to do, at a glance: the gist (Claude's own
+// description of the command), Jarvis's tags from reading the actual
+// command, and the exact command — one line, tap to see it all.
+const RISKY_TAGS = new Set(["deletes files", "pushes to a remote", "changes git history", "installs packages", "goes online"]);
+function renderSummary(div, summary) {
+  const title = document.createElement("div");
+  title.className = "perm-title";
+  title.textContent = summary.title;
+  div.appendChild(title);
+  if (summary.tags?.length) {
+    const tags = document.createElement("div");
+    tags.className = "perm-tags";
+    for (const t of summary.tags) {
+      const chip = document.createElement("span");
+      chip.className = `perm-tag${RISKY_TAGS.has(t) ? " risky" : ""}`;
+      chip.textContent = t;
+      tags.appendChild(chip);
+    }
+    div.appendChild(tags);
+  }
+  if (summary.detail) {
+    const detail = document.createElement("div");
+    detail.className = "perm-detail";
+    detail.textContent = summary.detail;
+    detail.title = "Tap to show the full command";
+    detail.addEventListener("click", (e) => {
+      e.stopPropagation();
+      detail.classList.toggle("expanded");
+    });
+    div.appendChild(detail);
+  }
+}
+
 function appendMessage({ direction, type, content, tag, projectTag, toolUseID, sessionId, choiceId, choices }) {
   const div = document.createElement("div");
   const cls = type === "system" ? "system" : direction === "in" ? "in" : "out";
@@ -200,10 +344,16 @@ function appendMessage({ direction, type, content, tag, projectTag, toolUseID, s
     tagEl.textContent = label;
     div.appendChild(tagEl);
   }
-  div.appendChild(document.createTextNode(content));
+  const questions = type === "permission_request" && toolUseID ? permissions.get(toolUseID)?.questions : undefined;
+  const summary = type === "permission_request" && toolUseID ? permissions.get(toolUseID)?.summary : undefined;
+  // Cards show their request structured — the question, or the plain-English
+  // gist — instead of the raw text.
+  if (summary) renderSummary(div, summary);
+  else if (!questions) div.appendChild(document.createTextNode(content));
   if (type === "permission_request" && toolUseID) {
     div.classList.add("perm");
-    buildPermissionCard(div, toolUseID);
+    if (questions) buildQuestionCard(div, toolUseID, questions);
+    else buildPermissionCard(div, toolUseID);
   }
   if (choiceId && Array.isArray(choices)) buildChoiceButtons(div, choiceId, choices);
   if (sessionId && projectTag) {
@@ -218,7 +368,40 @@ function appendMessage({ direction, type, content, tag, projectTag, toolUseID, s
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+// Messages waiting for a busy session, straight from the server's queue —
+// exactly what will be sent when the session is free. ✕ takes one back.
+function renderQueue(sessions) {
+  queuePanel.replaceChildren();
+  queuePanel.classList.toggle("hidden", !sessions.length);
+  for (const s of sessions) {
+    const title = document.createElement("div");
+    title.className = "queue-title";
+    title.textContent = `Waiting to send to ${s.projectTag} — goes in when its turn ends`;
+    queuePanel.appendChild(title);
+    for (const item of s.items) {
+      const row = document.createElement("div");
+      row.className = "queue-item";
+      const text = document.createElement("span");
+      text.className = "queue-text";
+      text.textContent = item.text;
+      const remove = document.createElement("button");
+      remove.className = "queue-remove";
+      remove.textContent = "✕";
+      remove.setAttribute("aria-label", "Remove from queue");
+      remove.addEventListener("click", () => {
+        if (sendInbound({ type: "unqueue", queueItemId: item.id })) remove.disabled = true;
+      });
+      row.append(text, remove);
+      queuePanel.appendChild(row);
+    }
+  }
+}
+
 function handleServerMessage(msg) {
+  if (msg.type === "queue") {
+    renderQueue(msg.sessions);
+    return;
+  }
   if (msg.type === "history") {
     messagesEl.replaceChildren();
     permissionCards.clear();

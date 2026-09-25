@@ -70,9 +70,15 @@ const FAKE_CLAUDE_LOG = path.join(TMP, "claude-invocations.log");
 fs.mkdirSync(FAKE_BIN);
 fs.writeFileSync(
   path.join(FAKE_BIN, "claude"),
-  `#!/bin/sh\necho "cwd=$(pwd -P) $*" >> "$FAKE_CLAUDE_LOG"\n`,
+  // While the hold file exists the fake stays running, like a real claude
+  // mid-turn; otherwise it exits at once.
+  `#!/bin/sh\nprintf 'cwd=%s %s\\n' "$(pwd -P)" "$(printf '%s' "$*" | tr '\\n' '|')" >> "$FAKE_CLAUDE_LOG"\nwhile [ -e "$FAKE_CLAUDE_HOLD" ]; do sleep 0.1; done\n`,
   { mode: 0o755 },
 );
+
+const FAKE_CLAUDE_HOLD = path.join(TMP, "claude-hold");
+const holdClaude = () => fs.writeFileSync(FAKE_CLAUDE_HOLD, "");
+const releaseClaude = () => fs.rmSync(FAKE_CLAUDE_HOLD, { force: true });
 
 function claudeInvocations(): string[] {
   if (!fs.existsSync(FAKE_CLAUDE_LOG)) return [];
@@ -116,7 +122,7 @@ interface Server {
   output: string[];
 }
 
-async function startServer(opts: { port?: number; dbPath?: string } = {}): Promise<Server> {
+async function startServer(opts: { port?: number; dbPath?: string; env?: Record<string, string> } = {}): Promise<Server> {
   const port = opts.port ?? (await freePort());
   const dbPath = opts.dbPath ?? path.join(TMP, `jarvis-${crypto.randomUUID()}.db`);
   const output: string[] = [];
@@ -133,7 +139,9 @@ async function startServer(opts: { port?: number; dbPath?: string } = {}): Promi
       VAPID_SUBJECT: "mailto:harness@example.com",
       NODE_TLS_REJECT_UNAUTHORIZED: "0",
       FAKE_CLAUDE_LOG,
+      FAKE_CLAUDE_HOLD,
       PATH: `${FAKE_BIN}:${process.env.PATH}`,
+      ...opts.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -487,6 +495,9 @@ async function scenarioParsing() {
       hb.behavior() === "allow" && !ha.settled,
       `beta → ${hb.behavior() ?? "unresolved"} ${JSON.stringify(hb.result?.hookSpecificOutput?.decision ?? {})}; alpha settled=${ha.settled}; ${describeAck(ackB)}`);
 
+    // Approving lets beta's turn carry on; a new instruction waits for that
+    // turn to end, so end it the way claude would.
+    await stopHook(srv.port, "session-beta", projectDir("beta-app"));
     const ackI = await c.request({ type: "chat", content: "beta-app run the tests" });
     // Spawning the fake claude (a shell script) can take a while under load.
     await until(() => claudeInvocations().length > 0, 2000);
@@ -881,6 +892,7 @@ async function scenarioReplyTarget() {
 
     await c.request({ type: "decision", toolUseID: (await c.toolUseIdFor("session-gamma", "rm -rf gamma-cache"))!, decision: "deny" });
     await until(() => hg.settled, 1000);
+    await stopHook(srv.port, "session-gamma", gammaCwd); // the denied turn winds up
     resetClaudeLog();
     const ack9 = await c.request({ type: "chat", content: "run the tests instead", replyToSession: { sessionId: "session-gamma", changedMsAgo: 5000 } });
     const inv9 = await invokedAfter(2000);
@@ -974,6 +986,606 @@ async function scenarioOpenChoice() {
   }
 }
 
+function readPermissions(repo: string): { allow: string[]; ask: string[] } | undefined {
+  const f = path.join(repo, ".claude", "settings.local.json");
+  if (!fs.existsSync(f)) return undefined;
+  return JSON.parse(fs.readFileSync(f, "utf8")).permissions;
+}
+
+async function scenarioPermissionDefaults() {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-perms-")));
+  const port = await freePort();
+  const dbPath = path.join(root, "scratch.db");
+  try {
+    const mvnw = mkRepo(path.join(root, "repos", "svc-mvnw"), { files: { "pom.xml": "<project/>", mvnw: "#!/bin/sh\n" } });
+    const pomOnly = mkRepo(path.join(root, "repos", "svc-pom"), { files: { "pom.xml": "<project/>" } });
+    const npmApp = mkRepo(path.join(root, "repos", "web-app"), { files: { "package.json": JSON.stringify({ scripts: { test: "jest", build: "vite build" } }) } });
+    const npmBare = mkRepo(path.join(root, "repos", "web-lib"), { files: { "package.json": JSON.stringify({ name: "web-lib" }) } });
+    const spaced = mkRepo(path.join(root, "repos", "my repo"));
+    // A repo whose settings already have your own rules.
+    const custom = mkRepo(path.join(root, "repos", "custom"));
+    fs.mkdirSync(path.join(custom, ".claude"));
+    fs.writeFileSync(path.join(custom, ".claude", "settings.local.json"),
+      JSON.stringify({ permissions: { allow: ["Bash(make lint)"], deny: ["Bash(git push *)"] } }));
+
+    const r1 = runWatchProject([path.join(root, "repos")], dbPath, port);
+    const pm = readPermissions(mvnw), pp = readPermissions(pomOnly), pn = readPermissions(npmApp), pb = readPermissions(npmBare);
+    const ps = readPermissions(spaced), pc = readPermissions(custom);
+
+    check("12.1 read-only git with the repo's exact path is allowed; the path is never a wildcard",
+      r1.code === 0 && !!pm && pm.allow.includes(`Bash(git -C ${mvnw} log *)`) && pm.allow.includes(`Bash(git -C ${mvnw} status)`) &&
+        ![pm, pp, pn, pb, ps, pc].some((p) => p && p.allow.some((r) => r.includes("git -C *"))),
+      `exit=${r1.code}; stderr=${JSON.stringify(r1.stderr.slice(0, 200))}; sample=${JSON.stringify(pm?.allow.slice(0, 4))}`);
+    check("12.2 build/test rules match the repo's tooling: ./mvnw, mvn, or npm scripts that exist — offline and exact only",
+      !!pm && pm.allow.includes("Bash(./mvnw -o test)") && !pm.allow.some((r) => r.startsWith("Bash(./mvnw") && r.includes("*")) &&
+        !!pp && pp.allow.includes("Bash(mvn -o package)") && !pp.allow.some((r) => r.includes("mvnw")) &&
+        !!pn && pn.allow.includes("Bash(npm test)") && pn.allow.includes("Bash(npm run build)") &&
+        !!pb && !pb.allow.some((r) => r.startsWith("Bash(npm")) && !pm.allow.some((r) => /Bash\(\.\/mvnw (test|compile|package)/.test(r)),
+      `mvnw=${JSON.stringify(pm?.allow.filter((r) => r.includes("mvn")))}; npm=${JSON.stringify(pn?.allow.filter((r) => r.includes("npm")))}`);
+    check("12.3 state-changing git, installs, deletes, curl, and git's --output flag always ask",
+      !!pm && [`Bash(git -C ${mvnw} push)`, `Bash(git push *)`, `Bash(git -C ${mvnw} log * --output *)`, "Bash(npm install *)", "Bash(rm *)", "Bash(curl *)"]
+        .every((r) => pm.ask.includes(r)) && !pm.allow.some((r) => /push|fetch|commit|curl|install/.test(r)),
+      `ask sample=${JSON.stringify(pm?.ask.slice(0, 6))}`);
+    check("12.4 a path containing a space gets the quoted spelling too",
+      !!ps && ps.allow.includes(`Bash(git -C "${spaced}" status)`) && ps.allow.includes(`Bash(git -C ${spaced} status)`),
+      JSON.stringify(ps?.allow.filter((r) => r.includes("status"))));
+    check("12.5 rules already in the file are kept, including a stricter deny",
+      !!pc && pc.allow.includes("Bash(make lint)") && (pc as any).deny?.includes("Bash(git push *)"),
+      JSON.stringify(pc && { allow: pc.allow.slice(0, 2), deny: (pc as any).deny }));
+
+    const before = JSON.stringify(readPermissions(mvnw));
+    const r2 = runWatchProject([path.join(root, "repos")], dbPath, port);
+    check("12.6 re-running adds nothing — no duplicate rules",
+      r2.code === 0 && JSON.stringify(readPermissions(mvnw)) === before && r2.stdout.includes("already in place"),
+      `stdout=${JSON.stringify(r2.stdout.slice(-120))}`);
+
+    const optOut = mkRepo(path.join(root, "elsewhere", "opt-out"));
+    const r3 = runWatchProject([optOut, "--no-permissions"], dbPath, port);
+    check("12.7 --no-permissions writes the hooks but leaves permissions untouched",
+      r3.code === 0 && readPermissions(optOut) === undefined && fs.existsSync(path.join(optOut, ".claude", "settings.local.json")),
+      `exit=${r3.code}; perms=${JSON.stringify(readPermissions(optOut))}`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function stopHook(port: number, sessionId: string, cwd: string): Promise<unknown> {
+  return fetch(`http://localhost:${port}/api/hooks/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${HOOKS_SECRET}` },
+    body: JSON.stringify({ session_id: sessionId, cwd, hook_event_name: "Stop" }),
+  }).then((r) => r.json());
+}
+
+async function scenarioStartingSession() {
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const svc = fs.realpathSync(projectDir("slow-svc"));
+    registerProjectDirect(srv.dbPath, "slow-svc", svc);
+    const settle = () => sleep(400);
+
+    holdClaude(); // the launched claude stays mid-first-turn until released
+    const ack1 = await c.request({ type: "chat", content: "open slow-svc run the migration" });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const launch = claudeInvocations()[0] ?? "";
+    const sid = /--session-id (\S+)/.exec(launch)?.[1];
+    check("13.1 a launch picks its session ID up front and the session is registered immediately as starting",
+      !!sid && sid === ack1?.sessionId && launch.includes("--print run the migration"),
+      `launch=${JSON.stringify(launch)}; ${describeAck(ack1)}`);
+
+    const ack2 = await c.request({ type: "chat", content: "open slow-svc also check the logs" });
+    await settle();
+    check("13.2 a second open with an instruction during the window queues it instead of launching a duplicate",
+      claudeInvocations().length === 1 && ack2?.action === "queued" && ack2?.sessionId === sid,
+      `claude invoked: ${JSON.stringify(claudeInvocations())}; ${describeAck(ack2)}`);
+
+    const ack3 = await c.request({ type: "chat", content: "open slow-svc" });
+    await settle();
+    check("13.3 a second open with no instruction reports it's still starting, launching nothing",
+      claudeInvocations().length === 1 && ack3?.action === "starting",
+      `claude invoked: ${JSON.stringify(claudeInvocations())}; ${describeAck(ack3)}`);
+
+    const ack4 = await c.request({ type: "chat", content: "and summarise the result", replyToSession: { sessionId: sid, changedMsAgo: 5000 } });
+    await settle();
+    check("13.4 an unaddressed reply aimed at the starting session is queued too — nothing is run inside it mid-turn",
+      claudeInvocations().length === 1 && ack4?.action === "queued",
+      `claude invoked: ${JSON.stringify(claudeInvocations())}; ${describeAck(ack4)}`);
+
+    await stopHook(srv.port, sid!, svc);
+    await until(() => claudeInvocations().length > 1, 2000);
+    const after = claudeInvocations().slice(1);
+    check("13.5 when the first turn ends, everything queued goes in as one resumed turn, in order",
+      after.length === 1 && after[0].includes(`--resume ${sid}`) &&
+        after[0].indexOf("also check the logs") < after[0].indexOf("and summarise the result") && after[0].includes("also check the logs"),
+      `after stop: ${JSON.stringify(after)}`);
+
+    await stopHook(srv.port, sid!, svc); // the turn that delivered the queue ends
+    resetClaudeLog();
+    const ack6 = await c.request({ type: "chat", content: "open slow-svc run the tests" });
+    await until(() => claudeInvocations().length > 0, 2000);
+    check("13.6 once ready, it behaves as any open session: an instruction goes straight in",
+      claudeInvocations().length === 1 && claudeInvocations()[0].includes(`--resume ${sid}`) && ack6?.action === "instructed",
+      `claude invoked: ${JSON.stringify(claudeInvocations())}; ${describeAck(ack6)}`);
+    releaseClaude();
+
+    // A launch whose process dies before any turn ends doesn't block the
+    // project forever, and says what it didn't deliver.
+    const flaky = fs.realpathSync(projectDir("flaky-svc"));
+    registerProjectDirect(srv.dbPath, "flaky-svc", flaky);
+    resetClaudeLog();
+    const ack7 = await c.request({ type: "chat", content: "open flaky-svc build it" });
+    const ack8 = await c.request({ type: "chat", content: "open flaky-svc then deploy" });
+    await until(() => !!c.latest((e) => e.tag === "jarvis" && String(e.content).includes("exited before finishing")), 6000);
+    const notice = c.latest((e) => e.tag === "jarvis" && String(e.content).includes("exited before finishing"))?.content ?? "";
+    resetClaudeLog();
+    const ack9 = await c.request({ type: "chat", content: "open flaky-svc build it again" });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const relaunch = claudeInvocations()[0] ?? "";
+    check("13.7 a launch that dies before finishing a turn is closed, reports the queued message it didn't send, and can be opened again",
+      ack8?.action === "queued" && notice.includes('"then deploy"') &&
+        relaunch.includes("--session-id") && !relaunch.includes(String(ack7?.sessionId)) && ack9?.action === "launching",
+      `notice=${JSON.stringify(notice)}; relaunch=${JSON.stringify(relaunch)}; ${describeAck(ack9)}`);
+
+    c.close();
+  } finally {
+    releaseClaude();
+    await killServer(srv);
+  }
+}
+
+function userPromptSubmitHook(port: number, sessionId: string, cwd: string, prompt: string): Promise<unknown> {
+  return fetch(`http://localhost:${port}/api/hooks/user-prompt-submit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${HOOKS_SECRET}` },
+    body: JSON.stringify({ session_id: sessionId, cwd, hook_event_name: "UserPromptSubmit", prompt }),
+  }).then((r) => r.json());
+}
+
+async function scenarioMidTurn() {
+  resetClaudeLog();
+  const srv = await startServer({ env: { BUSY_NUDGE_MS: "1500" } });
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const termCwd = projectDir("term-svc");
+    const jarvisCwd = projectDir("jarvis-svc");
+    const settle = () => sleep(400);
+    const to = (sessionId: string) => ({ sessionId, changedMsAgo: 5000 });
+
+    // --- A turn you started in a terminal (seen only through its hooks) ---
+    await stopHook(srv.port, "session-term", termCwd); // an idle, known session
+    await userPromptSubmitHook(srv.port, "session-term", termCwd, "refactor the auth module");
+    resetClaudeLog();
+    const ack1 = await c.request({ type: "chat", content: "also update the README", replyToSession: to("session-term") });
+    await settle();
+    check("14.1 a message for a session whose terminal turn is running waits — no second process",
+      claudeInvocations().length === 0 && ack1?.action === "queued",
+      `claude invoked: ${JSON.stringify(claudeInvocations())}; ${describeAck(ack1)}`);
+
+    const ack2 = await c.request({ type: "chat", content: "open term-svc and bump the version" });
+    await settle();
+    check("14.2 …and so does a second one, including via open",
+      claudeInvocations().length === 0 && ack2?.action === "queued",
+      `claude invoked: ${JSON.stringify(claudeInvocations())}; ${describeAck(ack2)}`);
+
+    await stopHook(srv.port, "session-term", termCwd);
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv3 = claudeInvocations();
+    check("14.3 when the terminal turn ends, the waiting messages go in as one turn, in order",
+      inv3.length === 1 && inv3[0].includes("--resume session-term") &&
+        inv3[0].indexOf("also update the README") < inv3[0].indexOf("bump the version"),
+      `claude invoked: ${JSON.stringify(inv3)}`);
+
+    // --- Two turns started by Jarvis back to back ---
+    await stopHook(srv.port, "session-term", termCwd); // the delivered turn ends
+    await stopHook(srv.port, "session-jarvis", jarvisCwd);
+    holdClaude();
+    resetClaudeLog();
+    await c.request({ type: "chat", content: "run the linter", replyToSession: to("session-jarvis") });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const ack5 = await c.request({ type: "chat", content: "then fix what it finds", replyToSession: to("session-jarvis") });
+    await settle();
+    check("14.4 a second message while Jarvis's own resumed turn is running waits instead of starting a concurrent process",
+      claudeInvocations().length === 1 && ack5?.action === "queued",
+      `claude invoked: ${JSON.stringify(claudeInvocations())}; ${describeAck(ack5)}`);
+
+    resetClaudeLog();
+    releaseClaude(); // the process exits without ever sending Stop
+    await until(() => claudeInvocations().length > 0, 3000);
+    const inv6 = claudeInvocations();
+    const notice6 = c.latest((e) => e.tag === "jarvis" && String(e.content).includes("ended without reporting back"))?.content ?? "";
+    check("14.5 if that process exits without a Stop, the session is free: the waiting message is sent, and you're told why",
+      inv6.length === 1 && inv6[0].includes("--resume session-jarvis") && inv6[0].includes("then fix what it finds") && !!notice6,
+      `claude invoked: ${JSON.stringify(inv6)}; notice=${JSON.stringify(notice6)}`);
+
+    // --- A turn that went quiet (e.g. interrupted, which never sends Stop) ---
+    const quietCwd = projectDir("quiet-svc");
+    await stopHook(srv.port, "session-quiet", quietCwd);
+    await userPromptSubmitHook(srv.port, "session-quiet", quietCwd, "long task");
+    resetClaudeLog();
+    await c.request({ type: "chat", content: "open quiet-svc check the results" });
+    await until(() => !!c.latest((e) => e.tag === "jarvis" && String(e.content).includes("no activity")), 9000);
+    const nudge = c.latest((e) => e.tag === "jarvis" && String(e.content).includes("no activity"))?.content ?? "";
+    check("14.6 a quiet session with a message waiting gets one notice offering 'send now' — and nothing is sent on a guess",
+      nudge.includes("send now quiet-svc") && claudeInvocations().length === 0,
+      `nudge=${JSON.stringify(nudge)}; claude invoked: ${JSON.stringify(claudeInvocations())}`);
+
+    const ack7 = await c.request({ type: "chat", content: "send now quiet-svc" });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv7 = claudeInvocations();
+    check("14.7 'send now' delivers the waiting message anyway",
+      inv7.length === 1 && inv7[0].includes("--resume session-quiet") && inv7[0].includes("check the results") && ack7?.action === "sent_now",
+      `claude invoked: ${JSON.stringify(inv7)}; ${describeAck(ack7)}`);
+
+    c.close();
+  } finally {
+    releaseClaude();
+    await killServer(srv);
+  }
+}
+
+async function scenarioStatus() {
+  let srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    let c = await Client.open(srv.port, token);
+    const idCwd = projectDir("st-identity");
+    const acCwd = projectDir("st-auth");
+
+    // Old sessions left stored as "running": each was mid-turn (a request
+    // approved, turn carrying on) when Jarvis restarted, so no Stop arrived.
+    await stopHook(srv.port, "old-auth-idle", acCwd); // an older, cleanly idle session
+    for (const [sid, cwd] of [["old-identity", idCwd], ["newer-auth", acCwd]] as const) {
+      const h = permissionHook(srv.port, sid, cwd, `echo ${sid}`);
+      const id = await c.toolUseIdFor(sid, `echo ${sid}`);
+      await c.request({ type: "decision", toolUseID: id, decision: "allow" });
+      await until(() => h.settled, 1000);
+    }
+    c.close();
+    await killServer(srv);
+    srv = await startServer({ port: srv.port, dbPath: srv.dbPath });
+    c = await Client.open(srv.port, token);
+
+    // A fresh terminal session in identity is genuinely mid-turn.
+    await userPromptSubmitHook(srv.port, "new-identity", idCwd, "refactor");
+
+    const statusOf = async () => {
+      await c.request({ type: "chat", content: "status" });
+      return (c.latest((e) => e.tag === "jarvis" && String(e.content).startsWith("Active projects"))?.content ?? "") as string;
+    };
+    const st1 = await statusOf();
+    const lines = st1.split("\n").filter((l) => l.startsWith("• "));
+    check("15.1 status shows one line per project, however many sessions it has",
+      lines.length === 2 && lines.filter((l) => l.includes("st-identity")).length === 1 && lines.filter((l) => l.includes("st-auth")).length === 1,
+      JSON.stringify(st1));
+    check("15.2 the working session is the one shown for identity, with the stale one folded into a count",
+      lines.some((l) => l === "• st-identity — working, turn in progress (+1 older idle session)"), JSON.stringify(st1));
+    check("15.3 a stale stored 'running' is never shown — auth-central is idle",
+      lines.some((l) => l === "• st-auth — idle, ready for your next instruction (+1 older idle session)") && !/— running/.test(st1),
+      JSON.stringify(st1));
+
+    // Two sessions genuinely working in one project (two terminals).
+    await userPromptSubmitHook(srv.port, "second-identity", idCwd, "write tests");
+    const st2 = await statusOf();
+    check("15.4 two sessions truly active in one project are both listed",
+      st2.includes("• st-identity — 2 sessions active (+1 older idle session):") && st2.includes("new-iden") && st2.includes("second-i"),
+      JSON.stringify(st2));
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
+function askHook(port: number, sessionId: string, cwd: string, questions: unknown[]): HookCall {
+  const ac = new AbortController();
+  const call: HookCall = {
+    settled: false,
+    abort: () => ac.abort(),
+    behavior: () => call.result?.hookSpecificOutput?.decision?.behavior,
+  };
+  fetch(`http://localhost:${port}/api/hooks/permission-request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${HOOKS_SECRET}` },
+    body: JSON.stringify({ session_id: sessionId, cwd, hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion", tool_input: { questions } }),
+    signal: ac.signal,
+  })
+    .then((r) => r.json())
+    .then((json) => { call.settled = true; call.result = json; }, (err) => { call.settled = true; call.error = err; });
+  return call;
+}
+
+async function scenarioQuestions() {
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const cwd = projectDir("q-identity");
+    const trust = {
+      question: "How do requests reach the identity service, and who sets X-User-ID?",
+      header: "Trust model",
+      multiSelect: false,
+      options: [
+        { label: "Gateway verifies JWT", description: "An API gateway checks the token and sets X-User-ID." },
+        { label: "Identity verifies JWT", description: "Clients call identity directly with a bearer token." },
+        { label: "Not decided yet", description: "Stop here." },
+      ],
+    };
+    const answersOf = (h: HookCall) => h.result?.hookSpecificOutput?.decision?.updatedInput?.answers;
+    const ask = async (sid: string, qs: unknown[]) => {
+      const h = askHook(srv.port, sid, cwd, qs);
+      const id = await c.toolUseIdFor(sid, (qs[0] as any).question.slice(0, 30));
+      await sleep(FRESH_GUARD_WAIT_MS);
+      return { h, id: id! };
+    };
+
+    const a = await ask("q1", [trust]);
+    const snap = c.latest((e) => e.type === "permissions");
+    const item = snap?.items?.find((i: any) => i.toolUseID === a.id);
+    const card = c.latest((e) => e.type === "permission_request" && e.toolUseID === a.id);
+    check("16.1 an AskUserQuestion reaches the phone as its real question and options, not 'Permission requested… YES/NO'",
+      item?.questions?.[0]?.options?.length === 3 && item.questions[0].header === "Trust model" &&
+        item.questions[0].options[1].description.includes("bearer token") &&
+        String(card?.content).startsWith("Claude is asking (Trust model):") && !String(card?.content).includes("YES/NO"),
+      `item=${JSON.stringify(item)}; content=${JSON.stringify(card?.content)}`);
+
+    const ack2 = await c.request({ type: "decision", toolUseID: a.id, decision: "allow" });
+    await sleep(300);
+    const ack2b = await c.request({ type: "chat", content: "yes", replyTo: a.id });
+    await sleep(300);
+    check("16.2 a generic Approve, or a typed 'yes', on a question is refused — it's still waiting for an answer",
+      !a.h.settled && ack2?.reason === "needs_answer" && ack2b?.reason === "needs_answer",
+      `hook settled=${a.h.settled}; ${describeAck(ack2)}; ${describeAck(ack2b)}`);
+
+    const bad = await c.request({ type: "answer", toolUseID: a.id, answers: {} });
+    const ack3 = await c.request({ type: "answer", toolUseID: a.id, answers: { [trust.question]: "Identity verifies JWT" } });
+    await until(() => a.h.settled, 1000);
+    const dec = a.h.result?.hookSpecificOutput?.decision;
+    check("16.3 answering from the card allows the call with the answer keyed by question text — the shape Claude reads",
+      bad?.reason === "needs_answer" && ack3?.action === "answered" && dec?.behavior === "allow" &&
+        answersOf(a.h)?.[trust.question] === "Identity verifies JWT" && dec?.updatedInput?.questions?.[0]?.header === "Trust model",
+      `decision=${JSON.stringify(dec)}; ${describeAck(bad)}; ${describeAck(ack3)}`);
+    await sleep(200);
+    const status3 = c.latest((e) => e.type === "permissions")?.items?.find((i: any) => i.toolUseID === a.id)?.status;
+    check("16.4 …and the card is then marked answered", status3 === "answered", `status=${status3}`);
+
+    const b = await ask("q2", [trust]);
+    await c.request({ type: "chat", content: "2", replyTo: b.id });
+    await until(() => b.h.settled, 1000);
+    const cc = await ask("q3", [trust]);
+    await c.request({ type: "chat", content: "full report", replyTo: cc.id });
+    await until(() => cc.h.settled, 1000);
+    check("16.5 a typed reply answers it: an option number picks that option, other text is a free-text answer",
+      answersOf(b.h)?.[trust.question] === "Identity verifies JWT" && answersOf(cc.h)?.[trust.question] === "full report",
+      `number→${JSON.stringify(answersOf(b.h))}; text→${JSON.stringify(answersOf(cc.h))}`);
+
+    const multi = { question: "Which checks should run?", header: "Checks", multiSelect: true,
+      options: [{ label: "Lint" }, { label: "Unit tests" }, { label: "Integration tests" }] };
+    const m = await ask("q4", [multi]);
+    const badM = await c.request({ type: "answer", toolUseID: m.id, answers: { [multi.question]: ["Lint", "Fuzzing"] } });
+    await c.request({ type: "chat", content: "1,3", replyTo: m.id });
+    await until(() => m.h.settled, 1000);
+    check("16.6 multi-select answers are arrays of option labels; a label that isn't an option is refused",
+      badM?.reason === "needs_answer" && JSON.stringify(answersOf(m.h)?.[multi.question]) === JSON.stringify(["Lint", "Integration tests"]),
+      `answers=${JSON.stringify(answersOf(m.h))}; ${describeAck(badM)}`);
+
+    const t = await ask("q5", [trust]);
+    await c.request({ type: "decision", toolUseID: t.id, decision: "allow", answerInTerminal: true });
+    await until(() => t.h.settled, 1000);
+    const d = await ask("q6", [trust]);
+    await c.request({ type: "decision", toolUseID: d.id, decision: "deny" });
+    await until(() => d.h.settled, 1000);
+    const tDec = t.h.result?.hookSpecificOutput?.decision, dDec = d.h.result?.hookSpecificOutput?.decision;
+    check("16.7 'Answer in terminal' passes it on unanswered (a plain allow), and Dismiss denies it without stopping Claude",
+      tDec?.behavior === "allow" && tDec?.updatedInput === undefined &&
+        dDec?.behavior === "deny" && dDec?.interrupt === false && String(dDec?.message).includes("dismissed"),
+      `terminal=${JSON.stringify(tDec)}; dismiss=${JSON.stringify(dDec)}`);
+
+    const two = await ask("q7", [trust, multi]);
+    const ack8 = await c.request({ type: "chat", content: "2", replyTo: two.id });
+    await sleep(300);
+    const ack8b = await c.request({ type: "answer", toolUseID: two.id, answers: { [trust.question]: "Not decided yet", [multi.question]: ["Unit tests"] } });
+    await until(() => two.h.settled, 1000);
+    check("16.8 several questions at once can't be answered by one typed reply — the card answers them all together",
+      ack8?.reason === "needs_answer" && ack8b?.action === "answered" &&
+        answersOf(two.h)?.[trust.question] === "Not decided yet" && JSON.stringify(answersOf(two.h)?.[multi.question]) === '["Unit tests"]',
+      `${describeAck(ack8)}; answers=${JSON.stringify(answersOf(two.h))}`);
+
+    const bash = permissionHook(srv.port, "q8", cwd, "echo still-normal");
+    const bashId = await c.toolUseIdFor("q8", "echo still-normal");
+    await c.request({ type: "decision", toolUseID: bashId, decision: "allow" });
+    await until(() => bash.settled, 1000);
+    check("16.9 ordinary permission requests are unchanged: Approve allows them with no answers attached",
+      bash.behavior() === "allow" && bash.result?.hookSpecificOutput?.decision?.updatedInput === undefined,
+      JSON.stringify(bash.result));
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
+async function scenarioQueueControl() {
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const cwd = projectDir("qc-svc");
+    const to = { sessionId: "qc-session", changedMsAgo: 5000 };
+    const queueFor = (sid: string) => (c.latest((e) => e.type === "queue")?.sessions ?? []).find((s: any) => s.sessionId === sid)?.items ?? [];
+
+    await stopHook(srv.port, "qc-session", cwd);
+    await userPromptSubmitHook(srv.port, "qc-session", cwd, "long refactor"); // a terminal turn is running
+    await c.request({ type: "chat", content: "find out bottle neck in identity", replyToSession: to });
+    await c.request({ type: "chat", content: "full report", replyToSession: to });
+    await sleep(200);
+    const items = queueFor("qc-session");
+    await c.request({ type: "chat", content: "status" });
+    const st = c.latest((e) => e.tag === "jarvis" && String(e.content).startsWith("Active projects"))?.content ?? "";
+    check("17.1 the queue shows each waiting message's actual text, with an ID — and so does status",
+      items.length === 2 && items[0].text === "find out bottle neck in identity" && items[1].text === "full report" && !!items[0].id &&
+        st.includes('1. "find out bottle neck in identity"') && st.includes('2. "full report"'),
+      `queue=${JSON.stringify(items)}; status=${JSON.stringify(st)}`);
+
+    const fresh = await Client.open(srv.port, token);
+    const onConnect = await fresh.waitFor((e) => e.type === "queue");
+    check("17.2 a client that connects later gets the queue too",
+      onConnect?.sessions?.[0]?.items?.length === 2, JSON.stringify(onConnect));
+    fresh.close();
+
+    const ack3 = await c.request({ type: "unqueue", queueItemId: items[1].id });
+    await sleep(200);
+    check("17.3 removing one message takes it off the queue and leaves the rest",
+      ack3?.action === "unqueued" && JSON.stringify(queueFor("qc-session").map((i: any) => i.text)) === '["find out bottle neck in identity"]',
+      `${describeAck(ack3)}; queue=${JSON.stringify(queueFor("qc-session"))}`);
+
+    await stopHook(srv.port, "qc-session", cwd); // the terminal turn ends
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv = claudeInvocations();
+    check("17.4 when the session is free, only what's still queued is sent — the removed message never goes in",
+      inv.length === 1 && inv[0].includes("find out bottle neck in identity") && !inv[0].includes("full report") && queueFor("qc-session").length === 0,
+      `claude invoked: ${JSON.stringify(inv)}; queue=${JSON.stringify(queueFor("qc-session"))}`);
+
+    const ack5 = await c.request({ type: "unqueue", queueItemId: items[0].id });
+    check("17.5 removing a message that has already been sent is refused, not reported as removed",
+      ack5?.ok === false && ack5?.reason === "stale", describeAck(ack5));
+
+    // Take everything back: nothing is sent at all.
+    await stopHook(srv.port, "qc-session", cwd); // the delivered turn ends
+    await userPromptSubmitHook(srv.port, "qc-session", cwd, "another terminal turn");
+    await c.request({ type: "chat", content: "never mind this one", replyToSession: to });
+    await sleep(200);
+    const only = queueFor("qc-session")[0];
+    await c.request({ type: "unqueue", queueItemId: only?.id });
+    resetClaudeLog();
+    await stopHook(srv.port, "qc-session", cwd);
+    await sleep(600);
+    check("17.6 with every queued message removed, the turn ending sends nothing",
+      !!only && claudeInvocations().length === 0 && queueFor("qc-session").length === 0,
+      `claude invoked: ${JSON.stringify(claudeInvocations())}`);
+
+    // A launch that dies: a removed message isn't reported as lost.
+    const flaky = fs.realpathSync(projectDir("qc-flaky"));
+    registerProjectDirect(srv.dbPath, "qc-flaky", flaky);
+    holdClaude();
+    const launch = await c.request({ type: "chat", content: "open qc-flaky build it" });
+    await c.request({ type: "chat", content: "open qc-flaky keep this" });
+    await c.request({ type: "chat", content: "open qc-flaky drop this" });
+    await sleep(200);
+    const drop = queueFor(launch?.sessionId).find((i: any) => i.text === "drop this");
+    await c.request({ type: "unqueue", queueItemId: drop?.id });
+    releaseClaude();
+    await until(() => !!c.latest((e) => e.tag === "jarvis" && String(e.content).includes("exited before finishing")), 4000);
+    const lost = c.latest((e) => e.tag === "jarvis" && String(e.content).includes("exited before finishing"))?.content ?? "";
+    check("17.7 if a launch dies, the lost-message report lists only what was still queued",
+      lost.includes('"keep this"') && !lost.includes("drop this"), JSON.stringify(lost));
+    c.close();
+  } finally {
+    releaseClaude();
+    await killServer(srv);
+  }
+}
+
+function toolHook(port: number, sessionId: string, cwd: string, toolName: string, toolInput: unknown): HookCall {
+  const ac = new AbortController();
+  const call: HookCall = { settled: false, abort: () => ac.abort(), behavior: () => call.result?.hookSpecificOutput?.decision?.behavior };
+  fetch(`http://localhost:${port}/api/hooks/permission-request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${HOOKS_SECRET}` },
+    body: JSON.stringify({ session_id: sessionId, cwd, hook_event_name: "PermissionRequest", tool_name: toolName, tool_input: toolInput }),
+    signal: ac.signal,
+  }).then((r) => r.json()).then((j) => { call.settled = true; call.result = j; }, (e) => { call.settled = true; call.error = e; });
+  return call;
+}
+
+async function scenarioGatingAndCards() {
+  // --- Part 1: the rollout — reads beyond the repo free, writes never ---
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-gate-")));
+  const port = await freePort();
+  try {
+    const umbrella = path.join(root, "work");
+    const mvnRepo = mkRepo(path.join(umbrella, "svc-a"), { files: { "pom.xml": "<project/>", mvnw: "#!/bin/sh\n" } });
+    const nodeRepo = mkRepo(path.join(umbrella, "web-b"), { files: { "package.json": "{}" } });
+    const single = mkRepo(path.join(root, "solo-repo"));
+    runWatchProject([umbrella], path.join(root, "a.db"), port);
+    runWatchProject([single], path.join(root, "b.db"), port);
+    const perms = (repo: string) => JSON.parse(fs.readFileSync(path.join(repo, ".claude", "settings.local.json"), "utf8")).permissions;
+    const m2 = path.join(os.homedir(), ".m2", "repository");
+    const hasM2 = fs.existsSync(m2);
+    const pa = perms(mvnRepo), pb = perms(nodeRepo), ps = perms(single);
+    check("18.1 repos found under a folder can read their siblings without a prompt (the folder is an additional directory)",
+      pa.additionalDirectories?.includes(fs.realpathSync(umbrella)) && pb.additionalDirectories?.includes(fs.realpathSync(umbrella)),
+      JSON.stringify({ a: pa.additionalDirectories, b: pb.additionalDirectories }));
+    check("18.2 Maven repos can also read the local Maven cache; others and single-repo watches get no extra folders",
+      (!hasM2 || pa.additionalDirectories.includes(fs.realpathSync(m2))) && !pb.additionalDirectories.some((d: string) => d.includes(".m2")) &&
+        (ps.additionalDirectories ?? []).length === 0,
+      JSON.stringify({ a: pa.additionalDirectories, b: pb.additionalDirectories, solo: ps.additionalDirectories }));
+    check("18.3 Claude's edit tools are ask rules in every repo, so a wider readable area never loosens writes",
+      [pa, pb, ps].every((p) => ["Edit", "Write", "NotebookEdit"].every((t) => p.ask.includes(t))),
+      JSON.stringify(pa.ask.slice(0, 4)));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const cwd = fs.realpathSync(projectDir("card-svc"));
+    registerProjectDirect(srv.dbPath, "card-svc", cwd);
+    await c.request({ type: "chat", content: "open card-svc run the checks" });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const launch = claudeInvocations()[0] ?? "";
+    const sid = /--session-id (\S+)/.exec(launch)?.[1];
+    await stopHook(srv.port, sid!, cwd);
+    resetClaudeLog();
+    await c.request({ type: "chat", content: "then summarise", replyToSession: { sessionId: sid, changedMsAgo: 5000 } });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const resume = claudeInvocations()[0] ?? "";
+    check("18.4 every claude Jarvis starts — launch and resume — is pinned to the default permission mode",
+      launch.includes("--permission-mode default") && resume.includes("--permission-mode default") && resume.includes(`--resume ${sid}`),
+      `launch=${JSON.stringify(launch)}; resume=${JSON.stringify(resume)}`);
+
+    // --- Part 2: the card says what it wants to do, in plain English ---
+    const summaryOf = async (sid2: string, marker: string, tool: string, input: unknown) => {
+      const h = toolHook(srv.port, sid2, cwd, tool, input);
+      const id = await c.toolUseIdFor(sid2, marker);
+      const item = c.latest((e) => e.type === "permissions")?.items?.find((i: any) => i.toolUseID === id);
+      const card = c.latest((e) => e.type === "permission_request" && e.toolUseID === id);
+      h.abort();
+      return { summary: item?.summary, content: String(card?.content ?? "") };
+    };
+    const push = await summaryOf("card-1", "git push origin main", "Bash", { command: "git push origin main", description: "push the release branch." });
+    check("18.5 the card leads with Claude's own one-line description, in sentence case, not the raw command",
+      push.summary?.title === "Push the release branch" && !push.content.includes("Permission requested") && !push.content.includes("YES/NO") &&
+        push.content.startsWith("Push the release branch"),
+      JSON.stringify(push));
+    check("18.6 Jarvis tags what the command actually does, independent of the description",
+      JSON.stringify(push.summary?.tags) === JSON.stringify(["pushes to a remote"]) && push.summary?.detail === "git push origin main",
+      JSON.stringify(push.summary));
+
+    const sneaky = await summaryOf("card-2", "rm -rf build", "Bash", { command: "npm test && rm -rf build", description: "Run the unit tests" });
+    check("18.7 a harmless-sounding description doesn't hide a risky command — the tags still say it deletes files",
+      sneaky.summary?.title === "Run the unit tests" && sneaky.summary?.tags.includes("deletes files"), JSON.stringify(sneaky.summary));
+
+    const quoted = await summaryOf("card-3", "<release>", "Bash", { command: `grep -n "java.version\\|<release>" pom.xml`, description: "Find the Java version" });
+    const bare = await summaryOf("card-4", "curl -s https://api.example.com", "Bash", { command: "curl -s https://api.example.com/health" });
+    check("18.8 a '>' inside quotes isn't read as a redirect; a command with no description still gets a sensible gist",
+      quoted.summary?.tags.length === 0 && bare.summary?.title === "Make a web request" && bare.summary?.tags.includes("goes online"),
+      JSON.stringify({ quoted: quoted.summary, bare: bare.summary }));
+
+    const edit = await summaryOf("card-5", "Edit src/app.ts", "Edit", { file_path: path.join(cwd, "src", "app.ts"), old_string: "a", new_string: "b" });
+    check("18.9 an edit reads 'Edit <path relative to the project>' and is tagged as a write",
+      edit.summary?.title === "Edit src/app.ts" && edit.summary?.tags.includes("writes files"), JSON.stringify(edit.summary));
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
 // ---------- main ----------
 
 async function main() {
@@ -990,6 +1602,13 @@ async function main() {
     ["9. Ambiguous 'open' is refused, never guessed", scenarioAmbiguousOpen],
     ["10. Composer reply target", scenarioReplyTarget],
     ["11. Answering a 'which project?' list", scenarioOpenChoice],
+    ["12. Default permission rules from watch-project", scenarioPermissionDefaults],
+    ["13. A session that's still starting counts as open", scenarioStartingSession],
+    ["14. Messages for a session mid-turn wait for it", scenarioMidTurn],
+    ["15. Status: one line per project, live state only", scenarioStatus],
+    ["16. Claude's questions are answered, not approved", scenarioQuestions],
+    ["17. Seeing and removing queued messages", scenarioQueueControl],
+    ["18. Writes stay gated everywhere; cards in plain English", scenarioGatingAndCards],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;

@@ -7,13 +7,14 @@ import {
   addPushSubscription,
   removePushSubscription,
   markPendingPermissionsStale,
+  clearStartingSessions,
 } from "./db.js";
 import { serveStatic } from "./staticServer.js";
 import { attachWebSocketServer } from "./wsServer.js";
 import { broadcastPush } from "./push.js";
 import { resolvePermission } from "./agent/permissions.js";
 import { handleInbound } from "./agent/router.js";
-import { handleSessionStart, handlePermissionRequest, handleStop } from "./hooks/routes.js";
+import { handleSessionStart, handleUserPromptSubmit, handlePermissionRequest, handleStop } from "./hooks/routes.js";
 
 function readJsonBody(req: http.IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -136,6 +137,18 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.url === "/api/hooks/user-prompt-submit" && req.method === "POST") {
+    if (!requireHookAuth(req, res)) return;
+    readJsonBody(req)
+      .then((body) => handleUserPromptSubmit(body))
+      .then((result) => sendJson(res, 200, result))
+      .catch((err) => {
+        console.error("user-prompt-submit hook failed:", err);
+        sendJson(res, 400, { error: "Invalid request body" });
+      });
+    return;
+  }
+
   if (req.url === "/api/hooks/permission-request" && req.method === "POST") {
     if (!requireHookAuth(req, res)) return;
     // res "close" before the response is written means Claude Code dropped
@@ -207,6 +220,7 @@ server.headersTimeout = 0;
 // reinterpreted as new instructions.
 const staleCount = markPendingPermissionsStale();
 if (staleCount) console.log(`Marked ${staleCount} permission request(s) from a previous run as stale.`);
+clearStartingSessions();
 
 attachWebSocketServer(server, handleInbound);
 
