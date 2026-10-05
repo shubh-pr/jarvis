@@ -37,6 +37,35 @@ const replyTargetClear = document.getElementById("reply-target-clear");
 const activityEl = document.getElementById("activity");
 const workingLine = document.getElementById("working-line");
 
+const usageCard = document.getElementById("usage-card");
+
+// ---- Jarvis's face ----
+// One small SVG face, used in the header, on the login screen and on
+// Jarvis's messages. Its mood is page-wide (data-jarvis on <html>), so every
+// face changes together: idle (blinks), working (looks around), waiting (a
+// "!" — something needs you), offline (asleep).
+function jarvisFace() {
+  const span = document.createElement("span");
+  span.className = "jarvis-face";
+  span.setAttribute("aria-hidden", "true");
+  span.innerHTML = `<svg viewBox="0 0 64 64">
+    <rect class="face" x="4" y="6" width="56" height="52" rx="19" />
+    <path class="brow" d="M16 19 l10 -2" /><path class="brow" d="M48 19 l-10 -2" />
+    <g class="eyes"><ellipse class="eye" cx="23" cy="29" rx="5" ry="6.5" /><ellipse class="eye" cx="41" cy="29" rx="5" ry="6.5" /></g>
+    <path class="mouth" d="M25 42 q7 6 14 0" />
+    <g class="alert"><circle cx="55" cy="10" r="9" /><text x="55" y="14.5" text-anchor="middle">!</text></g>
+  </svg>`;
+  return span;
+}
+document.querySelectorAll("[data-face]").forEach((el) => el.replaceWith(jarvisFace()));
+
+function updateJarvisMood() {
+  const connected = ws && ws.readyState === WebSocket.OPEN;
+  const needsYou =
+    [...permissions.values()].some((p) => p.status === "pending") || [...drafts.values()].some((d) => d.status === "ready");
+  document.documentElement.dataset.jarvis = !connected ? "offline" : needsYou ? "waiting" : turns.size ? "working" : "idle";
+}
+
 let ws = null;
 let reconnectDelay = 1000;
 
@@ -366,6 +395,7 @@ function appendMessage({ id, direction, type, content, tag, projectTag, toolUseI
     const tagEl = document.createElement("span");
     tagEl.className = "msg-tag";
     tagEl.textContent = `${label} · ${clock(createdAt ?? Date.now())}`;
+    if (cls === "out") tagEl.prepend(jarvisFace());
     div.appendChild(tagEl);
   }
   const questions = type === "permission_request" && toolUseID ? permissions.get(toolUseID)?.questions : undefined;
@@ -639,6 +669,93 @@ function setTurns(msg) {
   renderWaiting();
 }
 
+// ---- Plan usage ----
+// The two bars Claude Code's /usage shows, from the status line on this Mac
+// (src/usage.ts): the five-hour session window and the weekly window. Shown
+// on the home screen, with when each resets and how fresh the numbers are —
+// they only update when a Claude Code terminal session gets a reply.
+let planUsage = null; // { fiveHour?, sevenDay?, updatedAt, offset }
+const USAGE_STALE_MS = 30 * 60_000;
+
+function setPlanUsage(msg) {
+  planUsage = msg.updatedAt ? { ...msg, offset: msg.now - Date.now() } : null;
+  renderUsage();
+}
+
+function untilText(ms) {
+  const mins = Math.max(0, Math.round(ms / 60_000));
+  if (mins < 60) return `${mins}m`;
+  const h = Math.floor(mins / 60);
+  return h < 24 ? `${h}h ${mins % 60}m` : `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+function usageRow(label, w, now) {
+  const row = document.createElement("div");
+  const pct = Math.min(100, Math.max(0, w.usedPercentage));
+  row.className = `usage-row${pct >= 95 ? " full" : pct >= 80 ? " high" : ""}`;
+  const line = document.createElement("div");
+  line.className = "usage-line";
+  const name = document.createElement("span");
+  name.className = "usage-label";
+  name.textContent = label;
+  const value = document.createElement("span");
+  value.className = "usage-pct";
+  value.textContent = `${Math.round(pct)}% used`;
+  line.append(name, value);
+  const bar = document.createElement("div");
+  bar.className = "usage-bar";
+  bar.setAttribute("role", "progressbar");
+  bar.setAttribute("aria-label", label);
+  bar.setAttribute("aria-valuenow", String(Math.round(pct)));
+  bar.setAttribute("aria-valuemin", "0");
+  bar.setAttribute("aria-valuemax", "100");
+  const fill = document.createElement("div");
+  fill.className = "usage-fill";
+  fill.style.width = `${pct}%`;
+  bar.appendChild(fill);
+  const reset = document.createElement("div");
+  reset.className = "usage-reset";
+  const left = w.resetsAt - now;
+  reset.textContent = left > 24 * 3_600_000
+    ? `Resets ${new Date(w.resetsAt).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}`
+    : `Resets in ${untilText(left)}`;
+  row.append(line, bar, reset);
+  return row;
+}
+
+function renderUsage() {
+  usageCard.replaceChildren();
+  usageCard.classList.remove("hidden");
+  const head = document.createElement("div");
+  head.className = "usage-head";
+  const title = document.createElement("span");
+  title.className = "usage-title";
+  title.textContent = "Plan usage";
+  head.appendChild(title);
+  usageCard.appendChild(head);
+
+  const now = Date.now() + (planUsage?.offset ?? 0);
+  // A window past its reset time no longer says anything.
+  const windows = [
+    ["Current session", planUsage?.fiveHour],
+    ["Weekly", planUsage?.sevenDay],
+  ].filter(([, w]) => w && w.resetsAt > now);
+  if (!windows.length) {
+    const empty = document.createElement("div");
+    empty.className = "usage-empty";
+    empty.textContent = "Shows up after your next reply in a Claude Code terminal on this Mac.";
+    usageCard.appendChild(empty);
+    return;
+  }
+  const updated = document.createElement("span");
+  const age = now - planUsage.updatedAt;
+  updated.className = `usage-updated${age > USAGE_STALE_MS ? " stale" : ""}`;
+  updated.textContent = age < 60_000 ? "Updated just now" : `Updated ${untilText(age)} ago`;
+  head.appendChild(updated);
+  for (const [label, w] of windows) usageCard.appendChild(usageRow(label, w, now));
+}
+setInterval(() => planUsage && renderUsage(), 60_000);
+
 // ---- Per-project history ----
 // A project is its full path (projectKey), never its display name. Home is
 // the list of projects; opening one shows its latest block of work, live;
@@ -777,6 +894,7 @@ function renderWaiting() {
   }
   renderWorkingLine();
   renderActivity();
+  updateJarvisMood();
   if (!currentProject) renderHome();
 }
 
@@ -790,7 +908,7 @@ function showHome() {
   backBtn.classList.add("hidden");
   historyBtn.classList.add("hidden");
   historyPanel.classList.add("hidden");
-  viewTitle.textContent = "JARVIS";
+  viewTitle.textContent = "Jarvis";
   viewSub.classList.add("hidden");
   history.replaceState(null, "", "/");
   loadProjects().catch(() => {});
@@ -1164,6 +1282,10 @@ function handleServerMessage(msg) {
     setTurns(msg);
     return;
   }
+  if (msg.type === "usage") {
+    setPlanUsage(msg);
+    return;
+  }
   if (msg.type === "drafts" || msg.type === "draft") {
     for (const d of msg.type === "drafts" ? msg.drafts : [msg.draft]) {
       drafts.set(d.id, d);
@@ -1265,6 +1387,7 @@ function connect() {
     connStatus.textContent = "connected";
     connStatus.className = "connected";
     connStatus.title = "Connected";
+    updateJarvisMood();
     reconnectDelay = 1000;
     // Reconnecting keeps you where you were; a notification's link
     // (?project=…) opens that project.
@@ -1290,6 +1413,7 @@ function connect() {
     connStatus.textContent = "disconnected";
     connStatus.className = "disconnected";
     connStatus.title = "Disconnected — reconnecting";
+    updateJarvisMood();
     if (event.code === 4401) {
       clearToken();
       showLogin("Session expired, please log in again.");

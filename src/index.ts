@@ -19,6 +19,7 @@ import { listProjectHistories, projectBlocks, projectMessages } from "./agent/hi
 import { searchHistory } from "./agent/search.js";
 import { handleSessionStart, handleUserPromptSubmit, handlePermissionRequest, handleStop, handleToolStart, handleToolEnd } from "./hooks/routes.js";
 import { adapterFor, getAdapter } from "./agent/adapters/index.js";
+import { recordRateLimits } from "./usage.js";
 
 // The hook URLs below are the ones watch-project has always written into
 // Claude Code's settings, so events arriving on them are Claude's.
@@ -212,6 +213,18 @@ const server = http.createServer((req, res) => {
   // an empty body (no output, no decision), sent before the event is even
   // looked at, whatever the body holds — malformed, oversized or otherwise.
   // A handler can't change it: it runs only after the reply has gone.
+  // Plan usage from the status line (usage.ts). Like the activity hooks it
+  // only ever gets an empty 200, so a status line never waits on Jarvis.
+  if (req.url === "/api/hooks/usage" && req.method === "POST") {
+    if (!requireHookAuth(req, res)) return;
+    readActivityBody(req).then((body) => {
+      res.writeHead(200);
+      res.end();
+      if (body?.rate_limits) recordRateLimits(body.rate_limits);
+    });
+    return;
+  }
+
   const activityHandler = req.method === "POST" ? ACTIVITY_HOOKS[req.url ?? ""] : undefined;
   if (activityHandler) {
     if (!requireHookAuth(req, res)) return;

@@ -1,4 +1,4 @@
-const CACHE_NAME = "jarvis-shell-v17";
+const CACHE_NAME = "jarvis-shell-v19";
 const SHELL_ASSETS = [
   "/",
   "/app.js",
@@ -55,7 +55,7 @@ self.addEventListener("push", (event) => {
     self.registration.showNotification(payload.title || "JARVIS", {
       body: payload.body || "",
       icon: "/icons/icon-192.png",
-      badge: "/icons/icon-192.png",
+      badge: "/icons/badge-96.png",
       data: { sessionId: payload.sessionId || null, url: payload.url || "/" },
       tag: payload.sessionId || undefined,
     }),

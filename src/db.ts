@@ -124,6 +124,19 @@ if (!messageColumns.some((c) => c.name === "tool_use_id")) {
   db.exec(`ALTER TABLE messages ADD COLUMN tool_use_id TEXT`);
 }
 
+// The latest plan usage Claude Code reported (usage.ts): one row, kept so
+// the bars survive a restart until the next report.
+db.exec(`CREATE TABLE IF NOT EXISTS plan_usage (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL)`);
+
+export function savePlanUsage(data: unknown): void {
+  db.prepare(`INSERT INTO plan_usage (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`).run(JSON.stringify(data));
+}
+
+export function loadPlanUsage(): unknown {
+  const row = db.prepare(`SELECT data FROM plan_usage WHERE id = 1`).get() as { data: string } | undefined;
+  return row ? JSON.parse(row.data) : undefined;
+}
+
 // Which agent runs each session and project (agent/adapters). Everything
 // stored before adapters existed was Claude Code, which the default records.
 for (const table of ["sessions", "projects"]) {
