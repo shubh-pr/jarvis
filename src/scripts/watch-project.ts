@@ -4,7 +4,7 @@ import path from "node:path";
 import "dotenv/config";
 import { registerProject, listSessions, listProjects } from "../db.js";
 import { discoverRepos, resolveTags, type ResolvedTag } from "../hooks/repoDiscovery.js";
-import { defaultPermissions, mergePermissions } from "../hooks/permissionDefaults.js";
+import { getAdapter, DEFAULT_AGENT } from "../agent/adapters/index.js";
 
 // Usage: npm run watch-project <path> [--force] [--no-permissions]
 //
@@ -15,7 +15,8 @@ import { defaultPermissions, mergePermissions } from "../hooks/permissionDefault
 // a repo underneath it, so hooks have to live in each repo. --force skips
 // discovery and registers <path> itself as one project.
 //
-// Each repo also gets default permission rules (see permissionDefaults.ts):
+// Each repo also gets default permission rules (see
+// agent/adapters/claude/permissionDefaults.ts):
 // read-only git and its offline build/test commands run without a prompt,
 // state-changing commands always ask. Existing rules are kept; re-running
 // only adds what's missing. --no-permissions leaves permissions untouched.
@@ -46,45 +47,9 @@ if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
 // there, which is the real path — not a symlink the user happened to type.
 const rootPath = fs.realpathSync(resolved);
 
-// UserPromptSubmit takes no matcher; it's written the way it was verified.
-function hookEntry(eventPath: string, timeout: number, matcher: string | null = "*") {
-  return {
-    ...(matcher === null ? {} : { matcher }),
-    hooks: [
-      {
-        type: "http",
-        url: `http://localhost:${JARVIS_PORT}/api/hooks/${eventPath}`,
-        headers: { Authorization: `Bearer ${HOOKS_SECRET}` },
-        timeout,
-      },
-    ],
-  };
-}
-
-// Writes the Jarvis hooks (and, unless --no-permissions, the default
-// permission rules) into the repo's settings. Returns the number of
-// permission rules added.
-function writeSettings(projectPath: string): number {
-  const claudeDir = path.join(projectPath, ".claude");
-  fs.mkdirSync(claudeDir, { recursive: true });
-  const settingsPath = path.join(claudeDir, "settings.local.json");
-  const settings = fs.existsSync(settingsPath) ? JSON.parse(fs.readFileSync(settingsPath, "utf8")) : {};
-  settings.hooks = settings.hooks ?? {};
-
-  const addIfMissing = (event: string, entry: ReturnType<typeof hookEntry>) => {
-    const list: any[] = (settings.hooks[event] ??= []);
-    const alreadyPresent = list.some((e) => e.hooks?.some((h: any) => h.url === entry.hooks[0].url));
-    if (!alreadyPresent) list.push(entry);
-  };
-  addIfMissing("SessionStart", hookEntry("session-start", 30));
-  addIfMissing("UserPromptSubmit", hookEntry("user-prompt-submit", 10, null)); // marks a turn as started
-  addIfMissing("PermissionRequest", hookEntry("permission-request", 604800)); // 7 days
-  addIfMissing("Stop", hookEntry("stop", 30));
-
-  const added = withPermissions ? mergePermissions(settings, defaultPermissions(projectPath, readDirsFor(projectPath))) : 0;
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-  return added;
-}
+// New projects run the default agent; its adapter writes the hooks (and,
+// unless --no-permissions, the default permission rules) into the repo.
+const adapter = getAdapter(DEFAULT_AGENT);
 
 // Where reading shouldn't prompt beyond the repo itself: the folder the
 // repos were discovered under (siblings are routinely read for context), and
@@ -119,11 +84,16 @@ const tags = resolveTags(targets, known);
 
 let rulesAdded = 0;
 for (const t of tags) {
-  rulesAdded += writeSettings(t.cwd);
+  rulesAdded += adapter.installProject(t.cwd, {
+    jarvisPort: JARVIS_PORT,
+    hooksSecret: HOOKS_SECRET,
+    withPermissions,
+    readDirs: readDirsFor(t.cwd),
+  });
   // Registering (not just writing hooks) is what makes the project a target
   // for "open <tag>" — JARVIS needs a cwd to spawn into before any session
   // has ever run there.
-  registerProject(t.tag, t.cwd);
+  registerProject(t.tag, t.cwd, adapter.id);
 }
 
 const home = os.homedir();

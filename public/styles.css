@@ -465,3 +465,19 @@ header button { white-space: nowrap; }
 #search-btn { font-size: 0.95rem; padding: 3px 9px; }
 #conn-status { font-size: 0; width: 10px; height: 10px; padding: 0; border-radius: 50%; background: var(--danger); }
 #conn-status.connected { background: var(--ok); }
+
+/* ---- send-to-a-colleague card ---- */
+.draft-card { border: 1px solid var(--accent); max-width: 92%; }
+.draft-to { font-weight: 600; font-size: 0.88rem; margin-bottom: 6px; }
+.draft-card textarea { width: 100%; border-radius: 8px; border: 1px solid var(--surface-2); background: var(--bg); color: var(--text); padding: 8px; font: inherit; resize: vertical; }
+.draft-text { font-style: italic; }
+.draft-note { font-size: 0.75rem; color: var(--text-dim); margin-top: 6px; }
+.draft-note.final { color: var(--text); font-weight: 600; }
+.draft-note.error { color: var(--danger); }
+.draft-note.warn { color: #fbbf24; }
+.draft-note.sent { color: var(--ok); }
+.draft-actions { display: flex; gap: 8px; margin-top: 8px; }
+.draft-btn { flex: 1; padding: 9px 0; border-radius: 10px; border: none; font-weight: 600; cursor: pointer; }
+.draft-btn.primary { background: var(--ok); color: #052e14; }
+.draft-btn.secondary { background: var(--surface-2); color: var(--text); flex: 0 0 30%; }
+.draft-btn:disabled { opacity: 0.45; cursor: default; }

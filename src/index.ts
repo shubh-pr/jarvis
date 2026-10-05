@@ -18,6 +18,11 @@ import { handleInbound } from "./agent/router.js";
 import { listProjectHistories, projectBlocks, projectMessages } from "./agent/history.js";
 import { searchHistory } from "./agent/search.js";
 import { handleSessionStart, handleUserPromptSubmit, handlePermissionRequest, handleStop } from "./hooks/routes.js";
+import { adapterFor, getAdapter } from "./agent/adapters/index.js";
+
+// The hook URLs below are the ones watch-project has always written into
+// Claude Code's settings, so events arriving on them are Claude's.
+const hookAgent = getAdapter("claude");
 
 function readJsonBody(req: http.IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -131,7 +136,7 @@ const server = http.createServer((req, res) => {
   if (req.url === "/api/hooks/session-start" && req.method === "POST") {
     if (!requireHookAuth(req, res)) return;
     readJsonBody(req)
-      .then((body) => handleSessionStart(body))
+      .then((body) => handleSessionStart(hookAgent, body))
       .then((result) => sendJson(res, 200, result))
       .catch((err) => {
         console.error("session-start hook failed:", err);
@@ -143,7 +148,7 @@ const server = http.createServer((req, res) => {
   if (req.url === "/api/hooks/user-prompt-submit" && req.method === "POST") {
     if (!requireHookAuth(req, res)) return;
     readJsonBody(req)
-      .then((body) => handleUserPromptSubmit(body))
+      .then((body) => handleUserPromptSubmit(hookAgent, body))
       .then((result) => sendJson(res, 200, result))
       .catch((err) => {
         console.error("user-prompt-submit hook failed:", err);
@@ -154,14 +159,14 @@ const server = http.createServer((req, res) => {
 
   if (req.url === "/api/hooks/permission-request" && req.method === "POST") {
     if (!requireHookAuth(req, res)) return;
-    // res "close" before the response is written means Claude Code dropped
+    // res "close" before the response is written means the agent dropped
     // the hook call — the request must not stay answerable after that.
     const connection = new AbortController();
     res.on("close", () => {
       if (!res.writableFinished) connection.abort();
     });
     readJsonBody(req)
-      .then((body) => handlePermissionRequest(body, connection.signal))
+      .then((body) => handlePermissionRequest(hookAgent, body, connection.signal))
       .then((result) => {
         if (result) sendJson(res, 200, result);
       })
@@ -175,7 +180,7 @@ const server = http.createServer((req, res) => {
   if (req.url === "/api/hooks/stop" && req.method === "POST") {
     if (!requireHookAuth(req, res)) return;
     readJsonBody(req)
-      .then((body) => handleStop(body))
+      .then((body) => handleStop(hookAgent, body))
       .then((result) => sendJson(res, 200, result))
       .catch((err) => {
         console.error("stop hook failed:", err);
@@ -247,7 +252,7 @@ server.headersTimeout = 0;
 const staleCount = markPendingPermissionsStale();
 if (staleCount) console.log(`Marked ${staleCount} permission request(s) from a previous run as stale.`);
 clearStartingSessions();
-for (const f of repairSessionFolders()) console.log(`Session ${f.id.slice(0, 8)}: folder corrected from ${f.from} to ${f.to} (from its transcript).`);
+for (const f of repairSessionFolders((s) => adapterFor(s).startFolder(s.transcript_path))) console.log(`Session ${f.id.slice(0, 8)}: folder corrected from ${f.from} to ${f.to} (from its transcript).`);
 
 attachWebSocketServer(server, handleInbound);
 

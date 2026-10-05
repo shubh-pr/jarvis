@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ import {
   setSessionStatus,
   listProjects,
   findLaunchableCwd,
+  findLaunchTarget,
   registerProject,
   addMessage,
   editMessage,
@@ -19,8 +20,10 @@ import {
 } from "../db.js";
 import { resolvePermission, listPendingPermissions } from "./permissions.js";
 import { validateAnswers, answersFromText, describeAnswers } from "./questions.js";
+import { findContact, createDraft, getDraft, updateDraft, cleanDraftText, sendToChat, DRAFT_PROMPT } from "./chatSend.js";
 import { broadcast, registerConnectSnapshot, type InboundMessage, type Reply } from "../wsServer.js";
 import { config } from "../config.js";
+import { adapterFor, getAdapter } from "./adapters/index.js";
 import type { SessionRecord } from "../types.js";
 
 const LEGACY_TEST_SESSION_ID = "shell-test";
@@ -30,6 +33,11 @@ const NO_RE = /^(n|no|deny|reject|stop|cancel)$/i;
 const STATUS_RE = /^(status|what'?s running|list projects?|what.*(projects?|running))\b/i;
 const OPEN_RE = /^(open|start|launch)\s+/i;
 const SEND_NOW_RE = /^send\s+now\b/i;
+// "summarize this change and send it to Rohan", "send a summary of the identity change to Rohan"
+const SUMMARY_RES = [
+  /^(?:summari[sz]e|write up)\b\s*(.*?)\s*,?\s*(?:and\s+)?send\s+(?:it\s+|that\s+)?to\s+(.+?)\s*[.!]*$/i,
+  /^send\s+(?:a\s+|the\s+)?summary\s+(?:of\s+(.*?)\s+)?to\s+(.+?)\s*[.!]*$/i,
+];
 
 // A typed reply can't prove which request the user was looking at. If the
 // request it would land on only just arrived, assume they haven't read it
@@ -55,7 +63,8 @@ type RefusalReason =
   | "unknown_project"
   | "needs_instruction"
   | "target_ended"
-  | "needs_answer";
+  | "needs_answer"
+  | "no_contact";
 
 function say(content: string): void {
   broadcast({ direction: "out", type: "chat", content, tag: "jarvis" });
@@ -104,6 +113,7 @@ interface Busy {
   token: string; // identifies which process's exit may end this turn
   lastActivity: number;
   nudged: boolean;
+  draftId?: string; // this turn is Jarvis asking for a summary to send
 }
 const busy = new Map<string, Busy>();
 
@@ -149,23 +159,19 @@ function markBusy(sessionId: string, tag: string, kind: Busy["kind"]): string {
   return token;
 }
 
-// Injects a turn into an existing session. Callers go through deliver(), so
-// this only runs when the session is free. Jarvis's own runs are pinned to
-// the default permission mode, so nothing it starts can auto-accept edits
-// or skip prompts, whatever a settings file says.
-function spawnResume(session: SessionRecord, text: string): ChildProcess {
+// Injects a turn into an existing session, through the session's own agent
+// adapter. Callers go through deliver(), so this only runs when the session
+// is free.
+function spawnResume(session: SessionRecord, text: string, draftId?: string): ChildProcess {
   const token = markBusy(session.id, session.project_tag, "turn");
-  const child = spawn("claude", ["--permission-mode", "default", "--resume", session.id, "--print", text], {
-    cwd: session.cwd!,
-    stdio: "ignore",
-    detached: true,
-  });
-  child.unref();
+  if (draftId) busy.get(session.id)!.draftId = draftId;
+  const adapter = adapterFor(session);
+  const child = adapter.resume({ sessionId: session.id, cwd: session.cwd!, text });
   child.on("error", (err) => {
     say(`Failed to reach "${session.project_tag}": ${err.message}`);
   });
   child.on("exit", (code) => {
-    if (code) say(`claude exited with code ${code} while handling your message for "${session.project_tag}".`);
+    if (code) say(`${adapter.command} exited with code ${code} while handling your message for "${session.project_tag}".`);
     // Stop is answered before the process can exit, so if this turn is
     // still marked busy it ended without one. The session is free again.
     setTimeout(() => {
@@ -173,36 +179,36 @@ function spawnResume(session: SessionRecord, text: string): ChildProcess {
       if (!entry || entry.token !== token) return;
       busy.delete(session.id);
       broadcastQueue();
+      if (entry.draftId) draftReplyArrived(entry.draftId, undefined);
       if (entry.queued.length) {
         say(`"${session.project_tag}"'s turn ended without reporting back; sending your queued message${entry.queued.length > 1 ? "s" : ""} now.`);
         const current = getSession(session.id);
         if (current) spawnResume(current, texts(entry).join("\n\n"));
+      } else {
+        startWaitingDraft(session.id);
       }
     }, EXIT_SETTLE_MS);
   });
   return child;
 }
 
-// Originates a brand-new session — the one case where JARVIS runs `claude`
+// Originates a brand-new session — the one case where JARVIS runs an agent
 // somewhere it wasn't already running, rather than resuming one you started.
 // See ARCHITECTURE.md's "open <project>" note for why this is a deliberate
 // exception to "never spawns or owns agent sessions itself". Jarvis picks
-// the session ID, so the session is registered — and busy — at once.
-function spawnFresh(tag: string, cwd: string, instruction: string): string {
+// the session ID, so the session is registered — and busy — at once. The
+// project's agent runs it, and stays the session's agent from then on.
+function spawnFresh(tag: string, cwd: string, agent: string, instruction: string): string {
+  const adapter = getAdapter(agent);
   const sessionId = randomUUID();
-  upsertSession(sessionId, tag, "starting", { cwd });
+  upsertSession(sessionId, tag, "starting", { cwd, agent: adapter.id });
   const token = markBusy(sessionId, tag, "launch");
-  const child = spawn("claude", ["--permission-mode", "default", "--session-id", sessionId, "--print", instruction], {
-    cwd,
-    stdio: "ignore",
-    detached: true,
-  });
-  child.unref();
+  const child = adapter.launch({ sessionId, cwd, text: instruction });
   child.on("error", (err) => {
     say(`Failed to launch "${tag}": ${err.message}`);
   });
   child.on("exit", (code) => {
-    if (code) say(`claude exited with code ${code} while launching "${tag}".`);
+    if (code) say(`${adapter.command} exited with code ${code} while launching "${tag}".`);
     setTimeout(() => {
       const entry = busy.get(sessionId);
       if (!entry || entry.token !== token) return;
@@ -261,12 +267,114 @@ export function onTurnActivity(sessionId: string, tag: string): void {
   markBusy(sessionId, tag, "turn");
 }
 
-// A turn's Stop hook: the session is free, and anything queued goes in now.
-export function onTurnEnded(sessionId: string): void {
+// A turn's Stop hook: the session is free. A drafting turn's reply becomes
+// the draft; then anything queued goes in, and only after that does a
+// waiting draft get its own turn — so a draft request never shares a turn
+// with your messages, and its reply is only the summary.
+export function onTurnEnded(sessionId: string, lastText?: string): void {
   const entry = busy.get(sessionId);
   if (!entry) return;
   busy.delete(sessionId);
-  flush(sessionId, entry);
+  if (entry.draftId) draftReplyArrived(entry.draftId, lastText);
+  if (entry.queued.length) flush(sessionId, entry);
+  else startWaitingDraft(sessionId);
+}
+
+// ---- Summaries sent to a colleague (agent/chatSend.ts) ----
+const waitingDrafts = new Map<string, string[]>(); // sessionId -> draft IDs waiting for it to be free
+
+function startDraftTurn(session: SessionRecord, draftId: string): void {
+  spawnResume(session, DRAFT_PROMPT, draftId);
+}
+
+function startWaitingDraft(sessionId: string): void {
+  const ids = waitingDrafts.get(sessionId);
+  while (ids?.length) {
+    const id = ids.shift()!;
+    const d = getDraft(id);
+    if (d?.status !== "drafting") continue; // cancelled while waiting
+    const session = getSession(sessionId);
+    if (session) startDraftTurn(session, id);
+    break;
+  }
+  if (!ids?.length) waitingDrafts.delete(sessionId);
+}
+
+function draftReplyArrived(draftId: string, reply: string | undefined): void {
+  const d = getDraft(draftId);
+  if (!d || d.status !== "drafting") return;
+  const text = reply ? cleanDraftText(reply) : "";
+  if (text) updateDraft(d, { status: "ready", text });
+  else updateDraft(d, { status: "failed", outcomeUnknown: false, error: `${d.projectTag}'s session didn't reply with a summary. Nothing was sent — ask again to retry.` });
+}
+
+// "summarize this change and send it to Rohan": check the recipient, work
+// out which project (named, or the one you're replying to — never a guess),
+// then have that project's own session draft the line.
+function handleSummaryRequest(msg: Extract<InboundMessage, { type: "chat" }>, what: string, who: string, active: SessionRecord[], ack: Ack, refuse: Refuse): void {
+  echoUser(msg.content);
+  const found = findContact(who);
+  if (!found.ok) {
+    refuse("no_contact", found.error);
+    return;
+  }
+  const mention = findMentionedTag(what, active.map((s) => s.project_tag));
+  const anchor = msg.replyToSession ? getSession(msg.replyToSession.sessionId) : undefined;
+  const session = mention
+    ? active.find((s) => s.project_tag === mention.tag)
+    : anchor && anchor.status !== "done" && anchor.status !== "error"
+      ? anchor
+      : undefined;
+  if (!session || !session.cwd) {
+    refuse("unroutable", `Which project's change? Say it by name, e.g. "summarize the ${active[0]?.project_tag ?? "identity"} change and send it to ${found.contact.name}".`);
+    return;
+  }
+  const draft = createDraft({ sessionId: session.id, projectKey: session.cwd, projectTag: session.project_tag, to: found.contact });
+  if (busy.has(session.id)) {
+    waitingDrafts.set(session.id, [...(waitingDrafts.get(session.id) ?? []), draft.id]);
+    say(`"${session.project_tag}" is mid-turn — I'll ask it for the summary for ${found.contact.fullName} as soon as it's free.`);
+  } else {
+    startDraftTurn(session, draft.id);
+  }
+  ack(true, { action: "drafting", draftId: draft.id, sessionId: session.id });
+}
+
+// Only the card's Send button sends. It re-checks the recipient against
+// contacts.json (it may have changed since), marks the draft as sending
+// before anything goes out (so a second tap can't double-send), and never
+// retries a failure itself.
+async function handleDraftSend(msg: Extract<InboundMessage, { type: "draft_send" }>, ack: Ack, refuse: Refuse): Promise<void> {
+  const d = getDraft(msg.draftId);
+  if (!d) return refuse("stale", "That draft is gone — ask for the summary again.");
+  if (d.status === "sent" || d.status === "sending") return refuse("stale", `That summary was already sent to ${d.to.fullName}. It can't be sent twice from the same card.`);
+  if (d.status === "cancelled") return refuse("stale", "That draft was cancelled.");
+  if (d.status === "drafting") return refuse("stale", "The summary isn't drafted yet.");
+  const text = msg.text.trim();
+  if (!text) return refuse("needs_instruction", "The message is empty.");
+  if (text.length > 4000) return refuse("needs_instruction", "That's too long for one Chat message — keep it under 4,000 characters.");
+  const still = findContact(d.to.name);
+  if (!still.ok || still.contact.email !== d.to.email) {
+    updateDraft(d, { status: "failed", outcomeUnknown: false, error: `${d.to.name} isn't in contacts.json with that address any more, so nothing was sent.` });
+    return refuse("no_contact", `${d.to.name} isn't in contacts.json with that address any more. Nothing was sent.`);
+  }
+  updateDraft(d, { status: "sending", text, error: undefined, outcomeUnknown: undefined });
+  const outcome = await sendToChat(d.to.email, text);
+  if (!outcome.ok) {
+    updateDraft(d, { status: "failed", error: outcome.error, outcomeUnknown: outcome.outcomeUnknown });
+    ack(false, { reason: "send_failed", draftId: d.id });
+    return;
+  }
+  updateDraft(d, { status: "sent", sentAt: Date.now() });
+  const record = addMessage(d.sessionId, "out", "sent_external", `Sent to ${d.to.fullName} (${d.to.email}) on Google Chat: "${text}"`);
+  broadcast({ id: record.id, direction: "out", type: "sent_external", content: record.content, tag: d.projectTag, sessionId: d.sessionId, projectTag: d.projectTag, projectKey: d.projectKey });
+  ack(true, { action: "sent_external", draftId: d.id });
+}
+
+function handleDraftCancel(msg: Extract<InboundMessage, { type: "draft_cancel" }>, ack: Ack, refuse: Refuse): void {
+  const d = getDraft(msg.draftId);
+  if (!d || d.status === "sent" || d.status === "sending") return refuse("stale", "That summary has already been sent, so it can't be cancelled.");
+  updateDraft(d, { status: "cancelled" });
+  ack(true, { action: "draft_cancelled", draftId: d.id });
 }
 
 // Messages have been waiting on a quiet session for a while: say so, once.
@@ -489,6 +597,10 @@ export async function handleInbound(msg: InboundMessage, reply: Reply): Promise<
       handleUnqueue(msg, ack, refuse);
     } else if (msg.type === "edit_queued") {
       handleEditQueued(msg, ack, refuse);
+    } else if (msg.type === "draft_send") {
+      await handleDraftSend(msg, ack, refuse);
+    } else if (msg.type === "draft_cancel") {
+      handleDraftCancel(msg, ack, refuse);
     } else {
       handleChat(msg, ack, refuse);
     }
@@ -568,6 +680,14 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
   if (OPEN_RE.test(text)) {
     handleOpen(text, active, ack, refuse);
     return;
+  }
+
+  for (const re of SUMMARY_RES) {
+    const m = re.exec(text);
+    if (m) {
+      handleSummaryRequest(msg, m[1] ?? "", m[2], active, ack, refuse);
+      return;
+    }
   }
 
   if (SEND_NOW_RE.test(text)) {
@@ -886,15 +1006,15 @@ function openProject(tag: string, instruction: string, text: string, active: Ses
     return;
   }
 
-  const cwd = findLaunchableCwd(tag);
-  if (!cwd) {
+  const target = findLaunchTarget(tag);
+  if (!target) {
     echoUser(text, { projectTag: tag });
     refuse("unknown_project", `"${tag}" isn't watched yet — run \`npm run watch-project <path>\` for it first.`);
     return;
   }
 
-  registerProject(tag, cwd); // bumps last_used_at; self-heals if only known via an old session
-  const sessionId = spawnFresh(tag, cwd, instruction);
+  registerProject(tag, target.cwd, target.agent); // bumps last_used_at; self-heals if only known via an old session
+  const sessionId = spawnFresh(tag, target.cwd, target.agent, instruction);
   echoUser(text, { id: sessionId, projectTag: tag });
   ack(true, { action: "launching", projectTag: tag, sessionId });
 }

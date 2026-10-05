@@ -28,6 +28,8 @@ export type InboundMessage =
   | { type: "answer"; clientId?: string; toolUseID: string; answers: unknown }
   | { type: "unqueue"; clientId?: string; queueItemId: string }
   | { type: "edit_queued"; clientId?: string; queueItemId: string; text: string }
+  | { type: "draft_send"; clientId?: string; draftId: string; text: string }
+  | { type: "draft_cancel"; clientId?: string; draftId: string }
   | {
       type: "chat";
       clientId?: string;
@@ -100,6 +102,14 @@ function parseInbound(raw: string): InboundMessage | null {
       message: typeof parsed.message === "string" ? parsed.message : undefined,
       answerInTerminal: parsed.answerInTerminal === true,
     };
+  }
+  if (parsed.type === "draft_send") {
+    if (typeof parsed.draftId !== "string" || typeof parsed.text !== "string") return null;
+    return { type: "draft_send", clientId, draftId: parsed.draftId, text: parsed.text };
+  }
+  if (parsed.type === "draft_cancel") {
+    if (typeof parsed.draftId !== "string") return null;
+    return { type: "draft_cancel", clientId, draftId: parsed.draftId };
   }
   if (parsed.type === "edit_queued") {
     if (typeof parsed.queueItemId !== "string" || typeof parsed.text !== "string") return null;

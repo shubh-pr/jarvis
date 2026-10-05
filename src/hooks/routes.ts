@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import type { PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import {
   upsertSession,
   addMessage,
@@ -12,10 +11,14 @@ import {
 import { registerPendingPermission, cancelPermission } from "../agent/permissions.js";
 import { notify } from "../notifier.js";
 import { deriveProjectTag } from "./projectTag.js";
-import { readLastAssistantText } from "./transcript.js";
 import { onTurnEnded, onTurnActivity, isJarvisTurn } from "../agent/router.js";
-import { parseQuestions, questionContent } from "../agent/questions.js";
-import { describeRequest, summaryText } from "../agent/describe.js";
+import { questionContent } from "../agent/questions.js";
+import { summaryText } from "../agent/describe.js";
+import type { AgentAdapter, Decision } from "../agent/adapters/index.js";
+
+// Every handler takes the adapter for the agent that reported the event (the
+// hook URLs a project was set up with decide which), and reads the event
+// only through it.
 
 // A session's display name is fixed the first time we see it, so it can't
 // drift mid-conversation if a later, unrelated session happens to collide.
@@ -35,12 +38,11 @@ function resolveProjectTag(sessionId: string, cwd: string): string {
   return deriveProjectTag(cwd, known);
 }
 
-export async function handleSessionStart(body: any): Promise<object> {
-  const sessionId = body.session_id;
-  const cwd = body.cwd;
+export async function handleSessionStart(adapter: AgentAdapter, body: any): Promise<object> {
+  const { sessionId, cwd } = adapter.parseEvent(body);
   const projectTag = resolveProjectTag(sessionId, cwd);
 
-  upsertSession(sessionId, projectTag, "running", { cwd });
+  upsertSession(sessionId, projectTag, "running", { cwd, agent: adapter.id });
   const content = `Session started for project "${projectTag}".`;
   addMessage(sessionId, "out", "chat", content);
   await notify({ sessionId, projectTag, type: "chat", content });
@@ -49,41 +51,45 @@ export async function handleSessionStart(body: any): Promise<object> {
 
 // A prompt was submitted — a turn is starting, in a terminal or anywhere
 // else. Marks the session busy so nothing is sent into it until Stop.
-export async function handleUserPromptSubmit(body: any): Promise<object> {
-  const sessionId = body.session_id;
-  const cwd = body.cwd;
+export async function handleUserPromptSubmit(adapter: AgentAdapter, body: any): Promise<object> {
+  const { sessionId, cwd, prompt } = adapter.parseEvent(body);
   const projectTag = resolveProjectTag(sessionId, cwd);
   const existing = getSession(sessionId);
   // A prompt typed in a terminal is part of the project's history. One Jarvis
   // sent is already recorded as your message, so it isn't stored twice.
-  const typedInTerminal = !isJarvisTurn(sessionId) && typeof body.prompt === "string" && body.prompt.trim();
-  upsertSession(sessionId, projectTag, existing?.status === "starting" ? "starting" : "running", { cwd });
+  const typedInTerminal = !isJarvisTurn(sessionId) && typeof prompt === "string" && prompt.trim();
+  upsertSession(sessionId, projectTag, existing?.status === "starting" ? "starting" : "running", { cwd, agent: adapter.id });
   onTurnActivity(sessionId, projectTag);
   if (typedInTerminal) {
-    addMessage(sessionId, "in", "prompt", body.prompt.trim());
-    await notify({ sessionId, projectTag, type: "prompt", content: body.prompt.trim() });
+    addMessage(sessionId, "in", "prompt", prompt.trim());
+    await notify({ sessionId, projectTag, type: "prompt", content: prompt.trim() });
   }
   return {};
 }
 
-export async function handlePermissionRequest(body: any, connectionClosed: AbortSignal): Promise<object | null> {
-  const sessionId = body.session_id;
-  const cwd = body.cwd;
-  const toolName = body.tool_name;
-  const toolInput = body.tool_input ?? {};
+export async function handlePermissionRequest(
+  adapter: AgentAdapter,
+  body: any,
+  connectionClosed: AbortSignal,
+): Promise<object | null> {
+  const event = adapter.parseEvent(body);
+  const { sessionId, cwd } = event;
+  const toolName = event.toolName!;
+  const toolInput = event.toolInput ?? {};
   const projectTag = resolveProjectTag(sessionId, cwd);
 
-  upsertSession(sessionId, projectTag, "waiting_permission", { cwd });
+  upsertSession(sessionId, projectTag, "waiting_permission", { cwd, agent: adapter.id });
   onTurnActivity(sessionId, projectTag); // a permission request only ever happens mid-turn
 
   const toolUseID = crypto.randomUUID();
-  const questions = parseQuestions(toolName, toolInput);
-  const summary = questions ? undefined : describeRequest(toolName, toolInput, cwd);
-  const content = questions ? questionContent(questions) : summaryText(summary!);
+  const questions = adapter.parseQuestions(toolName, toolInput);
+  const summary = questions ? undefined : adapter.describeTool(toolName, toolInput, cwd);
+  const content = questions ? questionContent(questions, adapter.name) : summaryText(summary!);
   addMessage(sessionId, "out", "permission_request", content, toolUseID);
 
-  const decisionPromise = new Promise<PermissionResult | null>((resolve) => {
+  const decisionPromise = new Promise<Decision | null>((resolve) => {
     registerPendingPermission(toolUseID, {
+      agentName: adapter.name,
       sessionId,
       projectTag,
       toolName,
@@ -101,38 +107,15 @@ export async function handlePermissionRequest(body: any, connectionClosed: Abort
 
   const decision = await decisionPromise;
   if (!decision) return null; // cancelled — the caller has already gone away
-
-  if (decision.behavior === "allow") {
-    // Answers to an AskUserQuestion travel in the tool's input; a plain
-    // approval leaves the input as Claude sent it.
-    const answers = (decision.updatedInput as any)?.answers;
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PermissionRequest",
-        decision: answers ? { behavior: "allow", updatedInput: decision.updatedInput } : { behavior: "allow" },
-      },
-    };
-  }
-  return {
-    hookSpecificOutput: {
-      hookEventName: "PermissionRequest",
-      decision: {
-        behavior: "deny",
-        message: decision.message,
-        interrupt: decision.interrupt,
-      },
-    },
-  };
+  return adapter.formatDecision(decision, toolInput);
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function handleStop(body: any): Promise<object> {
-  const sessionId = body.session_id;
-  const cwd = body.cwd;
-  const transcriptPath = body.transcript_path;
+export async function handleStop(adapter: AgentAdapter, body: any): Promise<object> {
+  const { sessionId, cwd, transcriptRef: transcriptPath } = adapter.parseEvent(body);
   const projectTag = resolveProjectTag(sessionId, cwd);
 
   // The transcript's final write can lag slightly behind the Stop hook
@@ -145,7 +128,7 @@ export async function handleStop(body: any): Promise<object> {
   if (transcriptPath) {
     for (let attempt = 0; attempt < 6; attempt++) {
       if (attempt > 0) await sleep(300);
-      const candidate = readLastAssistantText(transcriptPath);
+      const candidate = adapter.lastReply(transcriptPath);
       if (candidate && candidate !== previous) {
         text = candidate;
         break;
@@ -156,11 +139,11 @@ export async function handleStop(body: any): Promise<object> {
 
   // Not terminal: the conversation stays resumable so a follow-up chat
   // message can continue this same session (§3.2).
-  upsertSession(sessionId, projectTag, "waiting_input", { cwd, transcriptPath });
+  upsertSession(sessionId, projectTag, "waiting_input", { cwd, transcriptPath, agent: adapter.id });
   addMessage(sessionId, "out", "completion", content);
   await notify({ sessionId, projectTag, type: "completion", content });
   // A session Jarvis launched is ready once its first turn ends; this sends
   // anything that was queued for it while it was starting.
-  onTurnEnded(sessionId);
+  onTurnEnded(sessionId, text ?? undefined);
   return {};
 }

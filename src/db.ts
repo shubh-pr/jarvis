@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import Database from "better-sqlite3";
 import { config } from "./config.js";
 import type {
@@ -29,7 +28,8 @@ db.exec(`
     last_event_at INTEGER NOT NULL,
     transcript_path TEXT,
     cwd TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    agent TEXT NOT NULL DEFAULT 'claude'
   );
 
   CREATE TABLE IF NOT EXISTS messages (
@@ -80,7 +80,8 @@ db.exec(`
     tag TEXT PRIMARY KEY,
     cwd TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    last_used_at INTEGER NOT NULL
+    last_used_at INTEGER NOT NULL,
+    agent TEXT NOT NULL DEFAULT 'claude'
   );
 `);
 
@@ -123,18 +124,27 @@ if (!messageColumns.some((c) => c.name === "tool_use_id")) {
   db.exec(`ALTER TABLE messages ADD COLUMN tool_use_id TEXT`);
 }
 
+// Which agent runs each session and project (agent/adapters). Everything
+// stored before adapters existed was Claude Code, which the default records.
+for (const table of ["sessions", "projects"]) {
+  if (!(db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === "agent")) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'`);
+  }
+}
+
 export function upsertSession(
   id: string,
   projectTag: string,
   status: SessionStatus,
-  opts: { transcriptPath?: string | null; cwd?: string | null } = {},
+  opts: { transcriptPath?: string | null; cwd?: string | null; agent: string },
 ): SessionRecord {
   const now = Date.now();
   const transcriptPath = opts.transcriptPath ?? null;
   const cwd = opts.cwd ?? null;
+  // The agent, like the folder, is set when the session is first stored.
   db.prepare(
-    `INSERT INTO sessions (id, project_tag, status, last_event_at, transcript_path, cwd, created_at)
-     VALUES (@id, @projectTag, @status, @now, @transcriptPath, @cwd, @now)
+    `INSERT INTO sessions (id, project_tag, status, last_event_at, transcript_path, cwd, created_at, agent)
+     VALUES (@id, @projectTag, @status, @now, @transcriptPath, @cwd, @now, @agent)
      ON CONFLICT(id) DO UPDATE SET
        status = @status,
        last_event_at = @now,
@@ -142,7 +152,7 @@ export function upsertSession(
        -- A session's folder is where it started, fixed at first sight. The cwd
        -- in later hook calls is wherever Claude's shell has cd'd to since.
        cwd = COALESCE(cwd, @cwd)`,
-  ).run({ id, projectTag, status, now, transcriptPath, cwd });
+  ).run({ id, projectTag, status, now, transcriptPath, cwd, agent: opts.agent });
   return getSession(id) as SessionRecord;
 }
 
@@ -153,24 +163,18 @@ export function clearStartingSessions(): number {
 }
 
 // Resets any session's stored folder that disagrees with its transcript,
-// which records the folder the session was started in (the first entry's
-// cwd). Sessions stored before folders were fixed at first sight may have
-// drifted to wherever Claude last cd'd. Returns the sessions corrected.
-export function repairSessionFolders(): { id: string; from: string | null; to: string }[] {
-  const rows = db.prepare(`SELECT id, cwd, transcript_path FROM sessions WHERE transcript_path IS NOT NULL`).all() as
-    { id: string; cwd: string | null; transcript_path: string }[];
+// which records the folder the session was started in (read by the
+// session's agent adapter). Sessions stored before folders were fixed at
+// first sight may have drifted to wherever the agent last cd'd. Returns the
+// sessions corrected.
+export function repairSessionFolders(
+  startFolder: (s: SessionRecord & { transcript_path: string }) => string | undefined,
+): { id: string; from: string | null; to: string }[] {
+  const rows = db.prepare(`SELECT * FROM sessions WHERE transcript_path IS NOT NULL`).all() as
+    (SessionRecord & { transcript_path: string })[];
   const fixed: { id: string; from: string | null; to: string }[] = [];
   for (const r of rows) {
-    let first: string | undefined;
-    try {
-      const fd = fs.openSync(r.transcript_path, "r");
-      const buf = Buffer.alloc(64 * 1024);
-      const n = fs.readSync(fd, buf, 0, buf.length, 0);
-      fs.closeSync(fd);
-      first = /"cwd":"((?:[^"\\]|\\.)*)"/.exec(buf.toString("utf8", 0, n))?.[1];
-    } catch {
-      continue;
-    }
+    const first = startFolder(r);
     if (first && first !== r.cwd) {
       db.prepare(`UPDATE sessions SET cwd = ? WHERE id = ?`).run(first, r.id);
       fixed.push({ id: r.id, from: r.cwd, to: first });
@@ -347,13 +351,14 @@ export function hasRecentDeadPermission(sinceMs: number): boolean {
   );
 }
 
-export function registerProject(tag: string, cwd: string): void {
+// A re-registration keeps the project's agent.
+export function registerProject(tag: string, cwd: string, agent: string): void {
   const now = Date.now();
   db.prepare(
-    `INSERT INTO projects (tag, cwd, created_at, last_used_at)
-     VALUES (@tag, @cwd, @now, @now)
+    `INSERT INTO projects (tag, cwd, created_at, last_used_at, agent)
+     VALUES (@tag, @cwd, @now, @now, @agent)
      ON CONFLICT(tag) DO UPDATE SET cwd = @cwd, last_used_at = @now`,
-  ).run({ tag, cwd, now });
+  ).run({ tag, cwd, now, agent });
 }
 
 export function getProject(tag: string): ProjectRecord | undefined {
@@ -368,18 +373,22 @@ export function listProjects(): ProjectRecord[] {
   return db.prepare(`SELECT * FROM projects ORDER BY tag`).all() as ProjectRecord[];
 }
 
-// A project's launchable cwd: the registry if it's been watched, else the
-// most recent session that ever ran there (covers projects set up before
-// this feature existed, without requiring them to be re-watched).
-export function findLaunchableCwd(tag: string): string | undefined {
+// Where and with which agent to launch a project: the registry if it's been
+// watched, else the most recent session that ever ran there (covers projects
+// set up before this feature existed, without requiring them to be
+// re-watched).
+export function findLaunchTarget(tag: string): { cwd: string; agent: string } | undefined {
   const registered = getProject(tag);
-  if (registered) return registered.cwd;
-  const row = db
+  if (registered) return { cwd: registered.cwd, agent: registered.agent };
+  return db
     .prepare(
-      `SELECT cwd FROM sessions WHERE project_tag = ? AND cwd IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
+      `SELECT cwd, agent FROM sessions WHERE project_tag = ? AND cwd IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
     )
-    .get(tag) as { cwd: string } | undefined;
-  return row?.cwd;
+    .get(tag) as { cwd: string; agent: string } | undefined;
+}
+
+export function findLaunchableCwd(tag: string): string | undefined {
+  return findLaunchTarget(tag)?.cwd;
 }
 
 export default db;

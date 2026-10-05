@@ -12,9 +12,10 @@ export interface SessionRecord {
   project_tag: string;
   status: SessionStatus;
   last_event_at: number;
-  transcript_path: string | null;
+  transcript_path: string | null; // the agent's own transcript reference
   cwd: string | null;
   created_at: number;
+  agent: string; // which adapter runs it (agent/adapters), fixed at first sight
 }
 
 export type MessageDirection = "out" | "in";
@@ -26,7 +27,8 @@ export type MessageType =
   | "completion"
   | "error"
   | "idle_nudge"
-  | "prompt"; // a prompt you typed in a terminal session
+  | "prompt" // a prompt you typed in a terminal session
+  | "sent_external"; // a summary you sent to a colleague (e.g. on Google Chat)
 
 export interface MessageRecord {
   id: number;
@@ -40,7 +42,8 @@ export interface MessageRecord {
 
 export type PermissionStatus = "pending" | "allowed" | "answered" | "denied" | "stale" | "cancelled";
 
-// Claude's AskUserQuestion tool input: real multiple-choice questions that
+// A multiple-choice question an agent asks (for Claude, its AskUserQuestion
+// tool, read by agent/adapters/claude/questions.ts): real questions that
 // need an answer, not a yes/no on whether a command may run.
 export interface QuestionOption {
   label: string;
@@ -62,7 +65,7 @@ export interface PermissionRecord {
   status: PermissionStatus;
   created_at: number;
   resolved_at: number | null;
-  questions: string | null; // JSON Question[] when this is an AskUserQuestion
+  questions: string | null; // JSON Question[] when the request is a question
   summary: string | null; // JSON RequestSummary: the plain-English card
 }
 
@@ -71,6 +74,7 @@ export interface ProjectRecord {
   cwd: string;
   created_at: number;
   last_used_at: number;
+  agent: string; // what "open <project>" launches; each session keeps its own
 }
 
 export interface PushSubscriptionRecord {

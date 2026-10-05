@@ -6,3 +6,7 @@ dist/
 *.db-wal
 *.db-shm
 .DS_Store
+
+# Colleagues' emails and the Google token that can send Chat messages as you
+contacts.json
+google-token.json

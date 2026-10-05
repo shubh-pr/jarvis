@@ -8,6 +8,15 @@ Before building the serverless architecture in §2–§10, a local prototype is 
 
 **2026-09-23 — deliberate scope change:** the above describes hooks that observe sessions *you* start. As of this date, JARVIS can also originate a session itself: saying `open <project>` for a project you've registered with `watch-project.ts` but haven't started running launches `claude --print "<instruction>"` there directly. This is narrower than it sounds — it only ever targets a project you explicitly registered in advance, it always requires an instruction (no default prompt), and once launched the session is tracked and observed exactly like a manually-started one from that point on. It does not change anything else in §0: permission requests still hold indefinitely with no default action, and JARVIS still never resumes or acts on an existing session without your say-so.
 
+**2026-09-25 — agreed; built except the Google sign-in: send a change summary to a colleague on Google Chat.** Everything not needing Google is built and tested against a stand-in Chat server (contacts, drafting, the send card, failures); what's left is the one-time OAuth sign-in and token refresh, which need the OAuth client from the Workspace admin (Cloud project with the Chat API, a configured Chat app, an Internal OAuth consent screen, a Desktop OAuth client, and approval of `chat.spaces.create` + `chat.messages.create` only — no service account or domain-wide delegation). Agreed design:
+- **A.** Sends as you, via your own one-time OAuth sign-in, into your DM with the person (`spaces.setup` returns the existing DM; `messages.create` sends).
+- **B.** Recipients come only from a local `contacts.json` you maintain (kept out of git): exact name match, no fuzzy/directory lookup, unknown names refused with the list, duplicates rejected. Only `@kronovate.com` addresses — a permanent restriction, not to be loosened for convenience.
+- **C.** "This change" is the current (or named) project's latest work; that project's own Claude session drafts the one-line summary, as a normal turn that queues if the session is busy.
+- **D.** A send card shows recipient name + email and the editable draft; only tapping Send sends (no typed "yes"; same short arming delay as permission cards). Once sent it's final — Jarvis can't unsend. Recorded in the project's history.
+- **E.** On demand only; text only; one recipient; no group spaces or attachments.
+- **F.** Failures are shown on the card and never retried automatically (a lost confirmation must not become a double send).
+- The OAuth token (which can send Chat messages as you) lives in a local file readable only by your user, kept out of git; revocable from your Google account.
+
 **What Phase 0 should prove out before moving to Phase 1 (serverless):**
 
 - The approval/decision-point UX is fast and unambiguous on a phone (push → open app → see exactly what's being asked → reply).
@@ -105,7 +114,7 @@ Jarvis receives callback → updates state → notifies phone → repeat
 
 - Voice (Phase 2).
 - Multi-user support (single operator).
-- Agents other than Claude Code (generalize later).
+- Agents other than Claude Code (generalize later). *(2026-10-05: all Claude Code–specific code now sits behind an adapter interface — `ARCHITECTURE.md`, "Agent adapters". That's structural cleanup only. It is not this generalization: there's no second agent, and Phase 1 is unchanged.)*
 - Tasks that genuinely need a long, uninterrupted-by-design compute run beyond GitHub Actions' hosted job limits (6 hrs) — flag this if it comes up; the fallback is Cloud Run Jobs, still serverless, no hard timeout.
 
 ## 6. Build order (please follow this sequence and check in after each milestone)

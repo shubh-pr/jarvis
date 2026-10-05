@@ -1,22 +1,23 @@
-import type { PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import { setSessionStatus, insertPermission, finishPermission, getPermission } from "../db.js";
 import { notify } from "../notifier.js";
 import { broadcastPermissions } from "../wsServer.js";
 import type { Question } from "../types.js";
 import type { Answers } from "./questions.js";
 import type { RequestSummary } from "./describe.js";
+import type { Decision } from "./adapters/index.js";
 
 const IDLE_NUDGE_MS = 120_000;
 
 interface PendingPermission {
+  agentName: string; // "Claude is still waiting…"
   sessionId: string;
   projectTag: string;
   toolName: string;
   input: Record<string, unknown>;
-  questions?: Question[]; // set for AskUserQuestion: needs an answer, not a yes/no
+  questions?: Question[]; // set for a question: needs an answer, not a yes/no
   summary?: RequestSummary; // the plain-English gist shown on the card
   requestedAt: number;
-  resolve: (result: PermissionResult | null) => void;
+  resolve: (result: Decision | null) => void;
   nudgeTimer: ReturnType<typeof setInterval>;
 }
 
@@ -51,12 +52,13 @@ export function registerPendingPermission(
       projectTag: entry.projectTag,
       type: "idle_nudge",
       content: entry.questions
-        ? `Claude is still waiting for your answer: ${entry.questions[0].question}`
+        ? `${entry.agentName} is still waiting for your answer: ${entry.questions[0].question}`
         : `Still waiting on you: ${entry.summary?.title ?? entry.toolName}`,
       toolUseID,
     });
   }, IDLE_NUDGE_MS);
   pending.set(toolUseID, {
+    agentName: entry.agentName,
     sessionId: entry.sessionId,
     projectTag: entry.projectTag,
     toolName: entry.toolName,
@@ -69,8 +71,8 @@ export function registerPendingPermission(
   broadcastPermissions();
 }
 
-// `answers` completes an AskUserQuestion: it's allowed with the answers in
-// its input, which is how Claude receives them.
+// `answers` completes a question: it's allowed with the answers, which the
+// agent's adapter passes back the way its agent expects.
 export function resolvePermission(
   toolUseID: string,
   decision: "allow" | "deny",
@@ -85,7 +87,7 @@ export function resolvePermission(
   finishPermission(toolUseID, decision === "deny" ? "denied" : answers ? "answered" : "allowed");
   setSessionStatus(p.sessionId, "running");
   if (decision === "allow") {
-    p.resolve({ behavior: "allow", updatedInput: answers ? { ...p.input, answers } : p.input });
+    p.resolve(answers ? { behavior: "allow", answers } : { behavior: "allow" });
   } else {
     p.resolve({
       behavior: "deny",
