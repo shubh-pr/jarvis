@@ -639,7 +639,15 @@ function renderHome() {
 function renderWaiting() {
   waitingStrip.replaceChildren();
   const elsewhere = [...pendingByProject()].filter(([key]) => key !== currentProject || !viewingLive);
-  waitingStrip.classList.toggle("hidden", !elsewhere.length);
+  const readyDrafts = [...drafts.values()].filter((d) => d.status === "ready" && (d.projectKey !== currentProject || !viewingLive));
+  waitingStrip.classList.toggle("hidden", !elsewhere.length && !readyDrafts.length);
+  for (const d of readyDrafts) {
+    const btn = document.createElement("button");
+    btn.className = "waiting-item";
+    btn.textContent = `Summary for ${d.to.fullName} is ready to review ›`;
+    btn.addEventListener("click", () => openProject(d.projectKey));
+    waitingStrip.appendChild(btn);
+  }
   for (const [key, n] of elsewhere) {
     const btn = document.createElement("button");
     btn.className = "waiting-item";
@@ -699,6 +707,7 @@ async function openProject(key, block, focusMessageId) {
   if (!viewingLive) replyTarget = null; // an old block isn't where a reply goes
   renderReplyTarget();
   renderViewingBar(viewingLive ? latest : block, viewingLive);
+  if (viewingLive) for (const d of drafts.values()) if (d.projectKey === key) renderDraft(d);
   renderWaiting();
   if (focusMessageId) {
     const el = messagesEl.querySelector(`[data-id="${focusMessageId}"]`);
@@ -939,11 +948,103 @@ historyBtn.addEventListener("click", () => {
   else historyPanel.classList.add("hidden");
 });
 
-const NAVIGATING_ACTIONS = new Set(["launching", "instructed", "queued", "already_open", "starting", "sent_now"]);
+const NAVIGATING_ACTIONS = new Set(["launching", "instructed", "queued", "already_open", "starting", "sent_now", "drafting"]);
+
+// ---- Sending a summary to a colleague ----
+// The card's state comes from the server. Only its Send button sends, after
+// the same short arming delay as permission cards; once sent it's final.
+const drafts = new Map();
+const DRAFT_ARM_MS = 1200;
+
+function renderDraft(d) {
+  let card = messagesEl.querySelector(`[data-draft="${d.id}"]`);
+  if (d.projectKey !== currentProject || !viewingLive) return;
+  if (!card) {
+    card = document.createElement("div");
+    card.className = "msg out draft-card";
+    card.dataset.draft = d.id;
+    messagesEl.appendChild(card);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+  const keepText = card.querySelector("textarea")?.value;
+  card.replaceChildren();
+  const head = document.createElement("span");
+  head.className = "msg-tag";
+  head.textContent = `Jarvis → ${d.projectTag} · send to a colleague`;
+  const to = document.createElement("div");
+  to.className = "draft-to";
+  to.textContent = `To ${d.to.fullName} · ${d.to.email} · Google Chat`;
+  card.append(head, to);
+
+  if (d.status === "drafting") {
+    card.append(note(`Asking ${d.projectTag} to summarize its latest change…`), actions([["Cancel", "secondary", () => sendInbound({ type: "draft_cancel", draftId: d.id })]]));
+    return;
+  }
+  if (d.status === "ready" || d.status === "failed") {
+    const area = document.createElement("textarea");
+    area.value = keepText ?? d.text;
+    area.rows = 3;
+    card.appendChild(area);
+    if (d.status === "failed") card.appendChild(note(d.error, d.outcomeUnknown ? "warn" : "error"));
+    card.appendChild(note("Once sent, it can't be unsent.", "final"));
+    const buttons = actions([
+      [d.status === "failed" ? "Send again" : "Send", "primary", () => {
+        const text = area.value.trim();
+        if (text && sendInbound({ type: "draft_send", draftId: d.id, text })) buttons.querySelectorAll("button").forEach((b) => (b.disabled = true));
+      }],
+      ["Cancel", "secondary", () => sendInbound({ type: "draft_cancel", draftId: d.id })],
+    ]);
+    const send = buttons.querySelector("button");
+    send.disabled = true; // armed after a moment, like permission cards
+    setTimeout(() => {
+      if (card.isConnected) send.disabled = false;
+    }, DRAFT_ARM_MS);
+    card.appendChild(buttons);
+    return;
+  }
+  const quote = document.createElement("div");
+  quote.className = "draft-text";
+  quote.textContent = d.text;
+  card.appendChild(quote);
+  if (d.status === "sending") card.appendChild(note("Sending…"));
+  if (d.status === "sent") card.appendChild(note(`Sent ${dayLabel(d.sentAt)} ${clock(d.sentAt)}. This is final.`, "sent"));
+  if (d.status === "cancelled") card.appendChild(note("Cancelled — nothing was sent."));
+}
+
+function note(text, kind = "") {
+  const n = document.createElement("div");
+  n.className = `draft-note ${kind}`;
+  n.textContent = text;
+  return n;
+}
+
+function actions(list) {
+  const row = document.createElement("div");
+  row.className = "draft-actions";
+  for (const [label, kind, fn] of list) {
+    const b = document.createElement("button");
+    b.className = `draft-btn ${kind}`;
+    b.textContent = label;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      fn();
+    });
+    row.appendChild(b);
+  }
+  return row;
+}
 
 function handleServerMessage(msg) {
   if (msg.type === "queue") {
     renderQueue(msg.sessions);
+    return;
+  }
+  if (msg.type === "drafts" || msg.type === "draft") {
+    for (const d of msg.type === "drafts" ? msg.drafts : [msg.draft]) {
+      drafts.set(d.id, d);
+      renderDraft(d);
+    }
+    renderWaiting();
     return;
   }
   if (msg.type === "message_updated") {

@@ -161,6 +161,6 @@ export async function handleStop(body: any): Promise<object> {
   await notify({ sessionId, projectTag, type: "completion", content });
   // A session Jarvis launched is ready once its first turn ends; this sends
   // anything that was queued for it while it was starting.
-  onTurnEnded(sessionId);
+  onTurnEnded(sessionId, text ?? undefined);
   return {};
 }

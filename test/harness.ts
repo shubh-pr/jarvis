@@ -1868,6 +1868,206 @@ async function scenarioEditQueued() {
   }
 }
 
+// A stand-in for the Google Chat API: records every call; can accept, refuse, or hang.
+interface ChatCall { path: string; auth?: string; body: any }
+async function startFakeChat() {
+  const calls: ChatCall[] = [];
+  const state = { mode: "ok" as "ok" | "refuse" | "hang" };
+  const port = await freePort();
+  const srv = (await import("node:http")).createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      calls.push({ path: req.url ?? "", auth: req.headers.authorization, body: body ? JSON.parse(body) : undefined });
+      const isMessage = (req.url ?? "").endsWith("/messages");
+      if (isMessage && state.mode === "hang") return; // never answers
+      if (isMessage && state.mode === "refuse") {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "The caller does not have permission" } }));
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(isMessage ? { name: "spaces/DM1/messages/M1" } : { name: "spaces/DM1", spaceType: "DIRECT_MESSAGE" }));
+    });
+  });
+  await new Promise<void>((r) => srv.listen(port, r));
+  srv.unref();
+  return { port, calls, state, messages: () => calls.filter((c) => c.path.endsWith("/messages")) };
+}
+
+function stopWithReply(port: number, sessionId: string, cwd: string, reply: string): Promise<unknown> {
+  const transcript = path.join(TMP, `transcript-${crypto.randomUUID()}.jsonl`);
+  fs.writeFileSync(transcript, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: reply }] } }) + "\n");
+  return fetch(`http://localhost:${port}/api/hooks/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${HOOKS_SECRET}` },
+    body: JSON.stringify({ session_id: sessionId, cwd, hook_event_name: "Stop", transcript_path: transcript }),
+  }).then((r) => r.json());
+}
+
+async function scenarioChatSummary() {
+  resetClaudeLog();
+  const chat = await startFakeChat();
+  const contactsPath = path.join(TMP, "contacts.json");
+  const tokenPath = path.join(TMP, "google-token.json");
+  const writeContacts = (list: unknown) => fs.writeFileSync(contactsPath, JSON.stringify(list));
+  const rohan = { name: "Rohan", fullName: "Rohan Sharma", email: "rohan@kronovate.com" };
+  fs.writeFileSync(tokenPath, JSON.stringify({ access_token: "test-access-token" }));
+  const srv = await startServer({ env: {
+    CONTACTS_PATH: contactsPath, GOOGLE_TOKEN_PATH: tokenPath,
+    GOOGLE_CHAT_API_BASE: `http://localhost:${chat.port}`, GOOGLE_CHAT_TIMEOUT_MS: "800",
+  } });
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const cwd = projectDir("sum-identity");
+    await stopHook(srv.port, "sum-session", cwd); // an idle identity session
+    const to = { sessionId: "sum-session", changedMsAgo: 5000 };
+    const ask = (text: string, extra: object = { replyToSession: to }) => c.request({ type: "chat", content: text, ...extra });
+    const draftOf = (id: string) => c.latest((e) => (e.type === "draft" && e.draft.id === id))?.draft;
+    const summaryAsk = "summarize this change and send it to Rohan";
+
+    writeContacts([{ ...rohan, email: "rohan.sharma@gmail.com" }]);
+    const a1 = await ask(summaryAsk);
+    writeContacts([rohan, { name: "rohan", fullName: "Rohan Verma", email: "rverma@kronovate.com" }]);
+    const a1b = await ask(summaryAsk);
+    check("22.1 contacts.json is refused outright for a non-@kronovate.com address or duplicate names — nothing drafted",
+      a1?.reason === "no_contact" && a1b?.reason === "no_contact" && claudeInvocations().length === 0 &&
+        c.events.some((e) => e.tag === "jarvis" && String(e.content).includes("Only @kronovate.com")),
+      `${describeAck(a1)}; ${describeAck(a1b)}`);
+
+    writeContacts([rohan, { name: "Priya", fullName: "Priya Nair", email: "priya@kronovate.com" }]);
+    const a2 = await ask("summarize this change and send it to Rohit");
+    const a2b = await ask(summaryAsk, {});
+    check("22.2 an unknown name is refused with your contact list (no near-miss guessing); no project to summarize is refused too",
+      a2?.reason === "no_contact" && c.events.some((e) => e.tag === "jarvis" && String(e.content).includes("Your contacts: Rohan, Priya")) &&
+        a2b?.reason === "unroutable" && claudeInvocations().length === 0,
+      `${describeAck(a2)}; ${describeAck(a2b)}`);
+
+    const a3 = await ask("Summarize this change and send it to rohan.");
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv3 = claudeInvocations()[0] ?? "";
+    const d3 = draftOf(a3?.draftId);
+    check("22.3 the project's own session is asked for a one-line summary, and a card appears addressed to exactly Rohan Sharma",
+      a3?.action === "drafting" && inv3.includes("--resume sum-session") && inv3.includes("In one line") &&
+        d3?.status === "drafting" && d3?.to?.email === "rohan@kronovate.com" && d3?.to?.fullName === "Rohan Sharma",
+      `claude=${JSON.stringify(inv3)}; draft=${JSON.stringify(d3)}`);
+
+    await stopWithReply(srv.port, "sum-session", cwd, "Summary: Added rate limiting to the login and signup endpoints.");
+    await until(() => draftOf(a3.draftId)?.status === "ready", 2000);
+    check("22.4 Claude's reply becomes the draft (tidied to one line) — and nothing has gone to Google yet",
+      draftOf(a3.draftId)?.text === "Added rate limiting to the login and signup endpoints." && chat.calls.length === 0,
+      JSON.stringify({ draft: draftOf(a3.draftId), googleCalls: chat.calls.length }));
+
+    await ask("yes");
+    await ask("send it");
+    await sleep(300);
+    check("22.5 typing 'yes' or 'send it' never sends — only the card's Send does", chat.calls.length === 0, `google calls=${chat.calls.length}`);
+
+    const s6 = await c.request({ type: "draft_send", draftId: a3.draftId, text: "Added rate limiting to login and signup (5/min per IP)." });
+    const [setup, message] = chat.calls;
+    const history = await fetch(`http://localhost:${srv.port}/api/projects/messages?key=${encodeURIComponent(cwd)}`, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json());
+    check("22.6 Send opens your DM with rohan@kronovate.com and sends your edited text as you; the card says sent, and history records it",
+      s6?.action === "sent_external" && setup?.path === "/v1/spaces:setup" && setup?.body?.space?.spaceType === "DIRECT_MESSAGE" &&
+        setup?.body?.memberships?.[0]?.member?.name === "users/rohan@kronovate.com" && message?.path === "/v1/spaces/DM1/messages" &&
+        message?.body?.text === "Added rate limiting to login and signup (5/min per IP)." && message?.auth === "Bearer test-access-token" &&
+        draftOf(a3.draftId)?.status === "sent" &&
+        history.messages.some((m: any) => m.type === "sent_external" && m.content.includes("Rohan Sharma (rohan@kronovate.com)")),
+      JSON.stringify({ ack: s6, calls: chat.calls.map((x) => x.path), draft: draftOf(a3.draftId)?.status }));
+
+    const s7 = await c.request({ type: "draft_send", draftId: a3.draftId, text: "again" });
+    check("22.7 a second Send on the same card is refused — exactly one message went out", s7?.ok === false && chat.messages().length === 1,
+      `${describeAck(s7)}; messages sent=${chat.messages().length}`);
+
+    // Failures: shown, never retried; an unknown outcome says to check first.
+    const fresh = async () => {
+      const a = await ask(summaryAsk);
+      await until(() => claudeInvocations().length > 0, 2000);
+      await stopWithReply(srv.port, "sum-session", cwd, "Fixed the tenant cache.");
+      await until(() => draftOf(a.draftId)?.status === "ready", 2000);
+      resetClaudeLog();
+      return a.draftId as string;
+    };
+    resetClaudeLog();
+    chat.state.mode = "refuse";
+    const f8 = await fresh();
+    const before8 = chat.messages().length;
+    await c.request({ type: "draft_send", draftId: f8, text: "Fixed the tenant cache." });
+    await sleep(1200);
+    check("22.8 a refused send is shown as failed ('nothing was sent') and never retried on its own",
+      draftOf(f8)?.status === "failed" && draftOf(f8)?.outcomeUnknown === false && String(draftOf(f8)?.error).includes("Nothing was sent") &&
+        chat.messages().length === before8 + 1,
+      JSON.stringify({ draft: draftOf(f8), attempts: chat.messages().length - before8 }));
+
+    chat.state.mode = "hang";
+    const f9 = await fresh();
+    await c.request({ type: "draft_send", draftId: f9, text: "Fixed the tenant cache." });
+    check("22.9 a send that times out says it may or may not have gone through, and to check Chat before sending again",
+      draftOf(f9)?.status === "failed" && draftOf(f9)?.outcomeUnknown === true && String(draftOf(f9)?.error).includes("may or may not"),
+      JSON.stringify(draftOf(f9)));
+
+    chat.state.mode = "ok";
+    const f10 = await fresh();
+    fs.rmSync(tokenPath);
+    const callsBefore = chat.calls.length;
+    await c.request({ type: "draft_send", draftId: f10, text: "Fixed the tenant cache." });
+    check("22.10 until Google Chat is connected, Send fails plainly and contacts nothing",
+      draftOf(f10)?.status === "failed" && String(draftOf(f10)?.error).includes("isn't connected yet") && chat.calls.length === callsBefore,
+      JSON.stringify(draftOf(f10)));
+    fs.writeFileSync(tokenPath, JSON.stringify({ access_token: "test-access-token" }));
+
+    const f11 = await fresh();
+    writeContacts([{ name: "Priya", fullName: "Priya Nair", email: "priya@kronovate.com" }]); // Rohan removed after drafting
+    const s11 = await c.request({ type: "draft_send", draftId: f11, text: "Fixed the tenant cache." });
+    check("22.11 the recipient is re-checked at Send: removed from contacts.json since the draft → nothing sent",
+      s11?.reason === "no_contact" && chat.calls.length === callsBefore, `${describeAck(s11)}; calls=${chat.calls.length - callsBefore}`);
+    writeContacts([rohan]);
+
+    // A busy session: your queued message goes in first; the draft request gets a turn of its own.
+    resetClaudeLog();
+    await userPromptSubmitHook(srv.port, "sum-session", cwd, "terminal turn");
+    await ask("also add a test for it");
+    const a12 = await ask(summaryAsk);
+    await sleep(300);
+    const whileBusy = claudeInvocations().length;
+    await stopHook(srv.port, "sum-session", cwd); // terminal turn ends → queued message goes in
+    await until(() => claudeInvocations().length > 0, 2000);
+    const first = claudeInvocations()[0] ?? "";
+    await stopWithReply(srv.port, "sum-session", cwd, "Added the test."); // that turn ends → now the draft turn
+    await until(() => claudeInvocations().length > 1, 2000);
+    const second = claudeInvocations()[1] ?? "";
+    await stopWithReply(srv.port, "sum-session", cwd, "Added rate limiting and a test for it.");
+    await until(() => draftOf(a12?.draftId)?.status === "ready", 2000);
+    check("22.12 with the session busy, your queued message goes in first, then the summary request alone — so the draft is just the summary",
+      whileBusy === 0 && first.includes("also add a test for it") && !first.includes("In one line") &&
+        second.includes("In one line") && !second.includes("also add a test") && draftOf(a12.draftId)?.text === "Added rate limiting and a test for it.",
+      JSON.stringify({ first, second, draft: draftOf(a12?.draftId) }));
+
+    // Two taps at the same instant: exactly one message goes out.
+    resetClaudeLog();
+    const f14 = await fresh();
+    const before14 = chat.messages().length;
+    const id1 = crypto.randomUUID(), id2 = crypto.randomUUID();
+    c.ws.send(JSON.stringify({ type: "draft_send", draftId: f14, text: "Fixed the tenant cache.", clientId: id1 }));
+    c.ws.send(JSON.stringify({ type: "draft_send", draftId: f14, text: "Fixed the tenant cache.", clientId: id2 }));
+    await until(() => ["sent", "failed"].includes(draftOf(f14)?.status), 3000);
+    await sleep(300);
+    check("22.14 two Sends fired at the same instant send exactly one message",
+      chat.messages().length === before14 + 1 && draftOf(f14)?.status === "sent", `messages sent=${chat.messages().length - before14}`);
+
+    const a13 = await ask(summaryAsk);
+    await until(() => claudeInvocations().length > 2, 2000);
+    await c.request({ type: "draft_cancel", draftId: a13.draftId });
+    await stopWithReply(srv.port, "sum-session", cwd, "Whatever.");
+    await sleep(300);
+    const s13 = await c.request({ type: "draft_send", draftId: a13.draftId, text: "Whatever." });
+    check("22.13 a cancelled draft stays cancelled when the reply arrives, and can't be sent",
+      draftOf(a13.draftId)?.status === "cancelled" && s13?.ok === false, JSON.stringify({ draft: draftOf(a13.draftId), ack: s13 }));
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
 // ---------- main ----------
 
 async function main() {
@@ -1894,6 +2094,7 @@ async function main() {
     ["19. Per-project history", scenarioProjectHistory],
     ["20. Search across history", scenarioSearch],
     ["21. Editing and removing queued messages", scenarioEditQueued],
+    ["22. Summarize a change and send it to a colleague (Google Chat stand-in)", scenarioChatSummary],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;

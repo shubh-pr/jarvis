@@ -21,4 +21,9 @@ export const config = {
   // How long a session with messages waiting for it can be silent before
   // Jarvis mentions it (an interrupted turn never sends Stop).
   busyNudgeMs: Number(process.env.BUSY_NUDGE_MS ?? 10 * 60_000),
+  // Sending a summary to a colleague on Google Chat (agent/chatSend.ts).
+  contactsPath: process.env.CONTACTS_PATH ?? "./contacts.json",
+  googleTokenPath: process.env.GOOGLE_TOKEN_PATH ?? "./google-token.json",
+  googleChatApiBase: process.env.GOOGLE_CHAT_API_BASE ?? "https://chat.googleapis.com",
+  googleChatTimeoutMs: Number(process.env.GOOGLE_CHAT_TIMEOUT_MS ?? 15_000),
 };

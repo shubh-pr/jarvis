@@ -26,7 +26,8 @@ export type MessageType =
   | "completion"
   | "error"
   | "idle_nudge"
-  | "prompt"; // a prompt you typed in a terminal session
+  | "prompt" // a prompt you typed in a terminal session
+  | "sent_external"; // a summary you sent to a colleague (e.g. on Google Chat)
 
 export interface MessageRecord {
   id: number;
