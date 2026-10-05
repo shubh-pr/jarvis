@@ -116,14 +116,18 @@ export function searchHistory(text: string, projectKey?: string): { results: Sea
 // Only the message's distinctive words count: ones that turn up in the
 // history of at most MAX_PROJECTS_PER_WORD projects (and not every project
 // with history), like "rbac" or "kong" — never "back", "the" or "work",
-// which every project has. How often a word appears doesn't matter: the
-// topic you're deep in is the one you mention most. Best match first. These
-// are suggestions: the caller always asks before acting on them.
+// which every project has. How often a word appears overall doesn't matter
+// (the topic you're deep in is the one you mention most), but a project is
+// only suggested if it matched in at least MIN_MENTIONS messages: a topic
+// recurs, a stray "hey" in one message doesn't. Best match first. These are
+// suggestions: the caller always asks before acting on them.
 const MAX_PROJECTS_PER_WORD = 2;
+const MIN_MENTIONS = 2;
 const STOP_WORDS = new Set(
   ("the and for with that this from into onto back lets let's look check please can could would should will just about " +
     "again then than what when where which while work working thing stuff project repo some more need want " +
-    "run fix add update make test tests build show tell see get use try start open close change done").split(" "),
+    "run fix add update make test tests build show tell see get use try start open close change done " +
+    "hey hello thanks thank jarvis you are how doing good morning evening").split(" "),
 );
 
 export function projectsDiscussing(text: string): string[] {
@@ -142,7 +146,12 @@ export function projectsDiscussing(text: string): string[] {
   });
   if (!distinctive.length) return [];
   const quoted = distinctive.map((w) => `"${w}"`);
-  let found = hits(quoted.join(" "));
-  if (!found.length && distinctive.length > 1) found = hits(quoted.join(" OR "));
-  return [...new Set(found.map((h) => h.projectTag))];
+  const recurring = (found: Hit[]) => {
+    const mentions = new Map<string, number>();
+    for (const h of found) mentions.set(h.projectTag, (mentions.get(h.projectTag) ?? 0) + 1);
+    return [...mentions.keys()].filter((tag) => mentions.get(tag)! >= MIN_MENTIONS); // best match first, as hits are
+  };
+  let projects = recurring(hits(quoted.join(" ")));
+  if (!projects.length && distinctive.length > 1) projects = recurring(hits(quoted.join(" OR ")));
+  return projects;
 }

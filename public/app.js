@@ -63,7 +63,32 @@ function updateJarvisMood() {
   const connected = ws && ws.readyState === WebSocket.OPEN;
   const needsYou =
     [...permissions.values()].some((p) => p.status === "pending") || [...drafts.values()].some((d) => d.status === "ready");
-  document.documentElement.dataset.jarvis = !connected ? "offline" : needsYou ? "waiting" : turns.size ? "working" : "idle";
+  document.documentElement.dataset.jarvis =
+    !connected ? "offline" : needsYou ? "waiting" : turns.size || thinkingEl ? "working" : "idle";
+}
+
+// While Jarvis is writing a chat reply (a few seconds), a "thinking" bubble
+// sits where the reply will appear.
+let thinkingEl = null;
+function setJarvisThinking(on) {
+  if (!on) {
+    thinkingEl?.remove();
+    thinkingEl = null;
+  } else if (!thinkingEl) {
+    thinkingEl = document.createElement("div");
+    thinkingEl.className = "msg out thinking";
+    const tagEl = document.createElement("span");
+    tagEl.className = "msg-tag";
+    tagEl.append(jarvisFace(), "Jarvis");
+    const dots = document.createElement("span");
+    dots.className = "thinking-dots";
+    dots.setAttribute("aria-label", "Jarvis is thinking");
+    dots.innerHTML = "<i></i><i></i><i></i>";
+    thinkingEl.append(tagEl, dots);
+    (currentProject ? messagesEl : homeFeed).appendChild(thinkingEl);
+    scrollToLatest(currentProject ? messagesEl : homeFeed);
+  }
+  updateJarvisMood();
 }
 
 let ws = null;
@@ -380,7 +405,8 @@ function renderSummary(div, summary) {
   }
 }
 
-function appendMessage({ id, direction, type, content, tag, projectTag, toolUseID, sessionId, choiceId, choices, createdAt, editedAt }, container = messagesEl) {
+function appendMessage({ id, direction, type, content, tag, projectTag, toolUseID, sessionId, choiceId, choices, createdAt, editedAt, toJarvis }, container = messagesEl) {
+  if (tag === "jarvis") setJarvisThinking(false); // the reply replaces "thinking"
   const div = document.createElement("div");
   if (id) div.dataset.id = String(id);
   const cls = type === "system" ? "system" : direction === "in" ? "in" : "out";
@@ -412,7 +438,8 @@ function appendMessage({ id, direction, type, content, tag, projectTag, toolUseI
   if (editedAt) div.classList.add("edited");
   if (cls === "in" && type === "chat") {
     div.classList.add("mine");
-    if (!id) div.classList.add("not-stored");
+    if (toJarvis) div.classList.add("to-jarvis");
+    else if (!id) div.classList.add("not-stored");
   }
   if (type === "permission_request" && toolUseID) {
     div.classList.add("perm");
@@ -430,7 +457,14 @@ function appendMessage({ id, direction, type, content, tag, projectTag, toolUseI
   }
   container.appendChild(div);
   if (div.classList.contains("mine")) renderMessageState(div);
-  container.scrollTop = container.scrollHeight;
+  scrollToLatest(container);
+}
+
+// Scrolls to the newest message. On the home screen the feed sits inside the
+// scrolling home view, so that's what has to move.
+function scrollToLatest(container = currentProject ? messagesEl : homeFeed) {
+  const scroller = container === homeFeed ? homeView : container;
+  scroller.scrollTop = scroller.scrollHeight;
 }
 
 // ---- Your messages: their state, and editing ones not sent yet ----
@@ -444,7 +478,9 @@ function renderMessageState(div) {
   const state = document.createElement("div");
   state.className = "msg-state";
   const item = div.dataset.id ? queuedByMessage.get(Number(div.dataset.id)) : undefined;
-  if (div.classList.contains("not-stored")) {
+  if (div.classList.contains("to-jarvis")) {
+    state.textContent = "To Jarvis";
+  } else if (div.classList.contains("not-stored")) {
     state.textContent = "Not sent to Claude";
   } else if (item) {
     state.append("Waiting to send · ");
@@ -1286,6 +1322,10 @@ function handleServerMessage(msg) {
     setPlanUsage(msg);
     return;
   }
+  if (msg.type === "jarvis_typing") {
+    setJarvisThinking(msg.on);
+    return;
+  }
   if (msg.type === "drafts" || msg.type === "draft") {
     for (const d of msg.type === "drafts" ? msg.drafts : [msg.draft]) {
       drafts.set(d.id, d);
@@ -1363,6 +1403,17 @@ async function login(passcode) {
   connect();
 }
 
+// False only when the server says the saved login is no good; unreachable
+// counts as still valid (keep retrying).
+async function loginStillValid() {
+  try {
+    const res = await fetch("/api/push/vapid-public-key", { headers: { Authorization: `Bearer ${getToken()}` } });
+    return res.status !== 401;
+  } catch {
+    return true;
+  }
+}
+
 function connect() {
   const token = getToken();
   if (!token) {
@@ -1395,10 +1446,10 @@ function connect() {
     loadProjects()
       .then(() => {
         const target = currentProject ?? linked;
-        if (target) openProject(target);
-        else showHome();
+        return target ? openProject(target) : showHome();
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => afterReconnect?.());
   };
 
   ws.onmessage = (event) => {
@@ -1419,8 +1470,18 @@ function connect() {
       showLogin("Session expired, please log in again.");
       return;
     }
-    setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 1.5, 15000);
+    // A rejected login never gets a socket at all — the server refuses the
+    // upgrade with a 401, which a browser reports only as a failed
+    // connection — so ask over HTTP before retrying.
+    loginStillValid().then((valid) => {
+      if (!valid) {
+        clearToken();
+        showLogin("Session expired, please log in again.");
+        return;
+      }
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 15000);
+    });
   };
 
   ws.onerror = () => {
@@ -1466,8 +1527,75 @@ function sendMessage() {
   const replyToSession = replyTarget
     ? { sessionId: replyTarget.sessionId, changedMsAgo: Date.now() - replyTarget.changedAt }
     : undefined;
-  if (sendInbound({ type: "chat", content: text, replyTo, replyToSession })) msgInput.value = "";
+  if (sendInbound({ type: "chat", content: text, replyTo, replyToSession })) {
+    msgInput.value = "";
+    scrollToLatest(); // your message and its answer land at the bottom
+  }
 }
+
+// ---- Pull down to refresh ----
+// An installed app has no browser refresh: pulling a list down from its top
+// past PULL_REFRESH_PX refreshes it (softRefresh), keeping you where you are.
+const PULL_REFRESH_PX = 70;
+const pullEl = document.createElement("div");
+pullEl.id = "pull-refresh";
+pullEl.className = "hidden";
+pullEl.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7" /></svg><span></span>';
+chatScreen.appendChild(pullEl);
+let pull = null;
+
+function endPull(refresh) {
+  pull = null;
+  if (refresh) softRefresh();
+  else pullEl.className = "hidden";
+}
+
+// Refreshing reconnects and reloads what you're looking at, in place: the
+// page never goes away, so there's no blank flash, and "Refreshing…" stays
+// until the fresh data is on screen. Only a newer version of the app (its
+// service worker taking over) needs a real reload.
+let afterReconnect = null;
+let refreshAskedAt = 0;
+function softRefresh() {
+  pullEl.className = "refreshing";
+  pullEl.style.transform = "translate(-50%, 20px)";
+  pullEl.querySelector("span").textContent = "Refreshing…";
+  refreshAskedAt = Date.now();
+  const done = () => {
+    afterReconnect = null;
+    clearTimeout(giveUp);
+    setTimeout(() => (pullEl.className = "hidden"), Math.max(0, 600 - (Date.now() - refreshAskedAt)));
+  };
+  const giveUp = setTimeout(done, 10_000);
+  afterReconnect = done;
+  navigator.serviceWorker?.getRegistration().then((reg) => reg?.update()).catch(() => {});
+  reconnectDelay = 1000;
+  connect();
+}
+navigator.serviceWorker?.addEventListener("controllerchange", () => {
+  if (Date.now() - refreshAskedAt < 15_000) location.reload();
+});
+
+document.addEventListener("touchstart", (e) => {
+  const list = e.target.closest?.("#home-view, #messages");
+  pull = list && list.scrollTop <= 0 && e.touches.length === 1 ? { list, startY: e.touches[0].clientY, dy: 0 } : null;
+}, { passive: true });
+
+document.addEventListener("touchmove", (e) => {
+  if (!pull) return;
+  pull.dy = e.touches[0].clientY - pull.startY;
+  if (pull.dy <= 0 || pull.list.scrollTop > 0) {
+    pullEl.className = "hidden";
+    return;
+  }
+  const ready = pull.dy >= PULL_REFRESH_PX;
+  pullEl.className = ready ? "ready" : "";
+  pullEl.style.transform = `translate(-50%, ${Math.min(pull.dy, PULL_REFRESH_PX * 1.5) * 0.5}px)`;
+  pullEl.querySelector("span").textContent = ready ? "Release to refresh" : "Pull to refresh";
+}, { passive: true });
+
+document.addEventListener("touchend", () => pull && endPull(pull.dy >= PULL_REFRESH_PX && pull.list.scrollTop <= 0));
+document.addEventListener("touchcancel", () => pull && endPull(false));
 
 sendBtn.addEventListener("click", sendMessage);
 
@@ -1592,7 +1720,11 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.ready.then(updatePushButtonVisibility).catch(() => {});
 }
 
+// Logged in: straight to the app, which shows "connecting" (sleepy face, red
+// dot) until the socket opens. The login screen is only for no login, or
+// one the server rejects — never a flash on every reload.
 if (getToken()) {
+  showChat();
   connect();
 } else {
   showLogin();

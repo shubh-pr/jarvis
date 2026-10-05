@@ -22,6 +22,7 @@ import { resolvePermission, listPendingPermissions } from "./permissions.js";
 import { validateAnswers, answersFromText, describeAnswers } from "./questions.js";
 import { findContact, createDraft, getDraft, updateDraft, cleanDraftText, sendToChat, DRAFT_PROMPT } from "./chatSend.js";
 import { projectsDiscussing } from "./search.js";
+import { chat } from "./jarvisChat.js";
 import { broadcast, registerConnectSnapshot, type InboundMessage, type Reply } from "../wsServer.js";
 import { config } from "../config.js";
 import { adapterFor, getAdapter } from "./adapters/index.js";
@@ -390,6 +391,20 @@ export function onToolEnd(sessionId: string, toolUseId?: string): void {
 // the draft; then anything queued goes in, and only after that does a
 // waiting draft get its own turn — so a draft request never shares a turn
 // with your messages, and its reply is only the summary.
+// A deny that interrupts (the Deny button, a typed "no") stops Claude's turn
+// there and then, but Claude Code sends no Stop for an interrupted turn.
+// Without this the turn would look busy forever: the denied tool still shown
+// running, and messages queued for it never sent. So shortly after such a
+// deny the turn is ended here, unless a Stop or a new turn got in first.
+const INTERRUPT_SETTLE_MS = 1500;
+function endInterruptedTurn(sessionId: string): void {
+  const entry = busy.get(sessionId);
+  if (!entry) return;
+  setTimeout(() => {
+    if (busy.get(sessionId) === entry) onTurnEnded(sessionId);
+  }, INTERRUPT_SETTLE_MS);
+}
+
 export function onTurnEnded(sessionId: string, lastText?: string): void {
   const entry = busy.get(sessionId);
   if (!entry) return;
@@ -766,6 +781,7 @@ function handleDecision(msg: Extract<InboundMessage, { type: "decision" }>, ack:
     refuse("stale", STALE_EXPLANATION, msg.toolUseID);
     return;
   }
+  if (msg.decision === "deny" && !question && record) endInterruptedTurn(record.session_id);
   echoUser(
     question
       ? msg.decision === "allow" ? "Answer it in the terminal" : "Dismissed the question"
@@ -927,6 +943,7 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
       resolvePermission(target.toolUseID, "allow");
     } else if (intent === "deny") {
       resolvePermission(target.toolUseID, "deny", undefined, true);
+      endInterruptedTurn(target.sessionId);
     } else {
       // Free-text guidance: deny this specific tool call, let the model
       // incorporate the guidance and decide how to proceed.
@@ -947,9 +964,11 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
   }
 
   if (active.length === 0) {
+    const nothingActive = "No projects are currently active. Start a claude session in a watched project first.";
     if (implicitOpen(text, active, ack, refuse) || sentenceOpen(text, active, ack, refuse)) return;
+    if (jarvisChat(text, active, ack, nothingActive) || smallTalk(text, active, ack)) return;
     echoUser(text);
-    refuse("unroutable", "No projects are currently active. Start a claude session in a watched project first.");
+    refuse("unroutable", nothingActive);
     return;
   }
 
@@ -965,10 +984,11 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
         ? active[0]
         : undefined;
   if (!session) {
+    const whichProject = `Which project? Active: ${[...activeProjects].join(", ")}.`;
     if (implicitOpen(text, active, ack, refuse) || sentenceOpen(text, active, ack, refuse)) return;
+    if (jarvisChat(text, active, ack, whichProject) || smallTalk(text, active, ack)) return;
     echoUser(text);
-    const projects = [...new Set(active.map((s) => s.project_tag))].join(", ");
-    refuse("unroutable", `Which project? Active: ${projects}.`);
+    refuse("unroutable", whichProject);
     return;
   }
 
@@ -1051,15 +1071,60 @@ function resolveOpenTarget(afterVerb: string, known: string[]): OpenTarget {
 const OPEN_CHOICE_TTL_MS = 10 * 60_000;
 const openChoices = new Map<string, { candidates: string[]; instruction: string; createdAt: number }>();
 
-function offerOpenChoice(candidates: { tag: string; cwd?: string }[], instruction: string, refuse: Refuse, lead: string): void {
+function registerOpenChoice(candidates: { tag: string; cwd?: string }[], instruction: string) {
   openChoices.clear();
   const choiceId = randomUUID();
   openChoices.set(choiceId, { candidates: candidates.map((c) => c.tag), instruction, createdAt: Date.now() });
-  const lines = candidates.map((c, i) => `${i + 1}. ${c.tag}${c.cwd ? ` — ${prettyPath(c.cwd)}` : ""}`);
-  refuse("ambiguous", `${lead} Reply with a number or tap one:\n${lines.join("\n")}`, undefined, {
+  return {
     choiceId,
+    lines: candidates.map((c, i) => `${i + 1}. ${c.tag}${c.cwd ? ` — ${prettyPath(c.cwd)}` : ""}`).join("\n"),
     choices: candidates.map((c) => ({ tag: c.tag, detail: c.cwd ? prettyPath(c.cwd) : undefined })),
-  });
+  };
+}
+
+function offerOpenChoice(candidates: { tag: string; cwd?: string }[], instruction: string, refuse: Refuse, lead: string): void {
+  const { choiceId, lines, choices } = registerOpenChoice(candidates, instruction);
+  refuse("ambiguous", `${lead} Reply with a number or tap one:\n${lines}`, undefined, { choiceId, choices });
+}
+
+// Anything else no session would take is a conversation with Jarvis
+// (jarvisChat.ts). The message is acknowledged at once; the reply follows
+// in a few seconds, with "thinking" shown meanwhile. A suggestion comes back
+// as the same picker "open" uses, showing the exact instruction a tap would
+// send — nothing is opened or sent without that tap. If Claude can't be
+// reached, you get the refusal you'd have had without chat.
+function jarvisChat(text: string, active: SessionRecord[], ack: Ack, fallback: string): boolean {
+  if (!config.chatEnabled) return false;
+  broadcast({ direction: "in", type: "chat", content: text, tag: "you", toJarvis: true });
+  ack(true, { action: "chat" });
+  broadcast({ type: "jarvis_typing", on: true });
+  const known = knownProjectTags();
+  const context = {
+    projects: known.map((tag) => ({ tag, path: prettyPath(findLaunchableCwd(tag) ?? "") })),
+    status: statusText(active),
+    waiting: listPendingPermissions().length,
+  };
+  chat(text, context)
+    .then(({ reply, suggest }) => {
+      const tags = suggest ? [...new Set(suggest.projects)].filter((tag) => known.includes(tag)) : [];
+      if (!suggest || !tags.length) return say(reply);
+      const { choiceId, lines, choices } = registerOpenChoice(tags.map((tag) => ({ tag, cwd: findLaunchableCwd(tag) })), suggest.instruction);
+      const where = tags.length === 1 ? tags[0] : "one of these";
+      broadcast({
+        direction: "out",
+        type: "chat",
+        tag: "jarvis",
+        content: `${reply}\n\nTap to send “${suggest.instruction}” to ${where}:\n${lines}`,
+        choiceId,
+        choices,
+      });
+    })
+    .catch((err) => {
+      console.error("jarvis chat failed:", err instanceof Error ? err.message : err);
+      say(`I couldn't reach Claude for a reply just now. ${fallback}`);
+    })
+    .finally(() => broadcast({ type: "jarvis_typing", on: false }));
+  return true;
 }
 
 // "open <project>" or "open <project> <instruction>".
@@ -1089,6 +1154,7 @@ function handleOpen(text: string, active: SessionRecord[], ack: Ack, refuse: Ref
 // nothing. This never takes a message a session would have.
 function implicitOpen(text: string, active: SessionRecord[], ack: Ack, refuse: Refuse): boolean {
   if (!/^\S+$/.test(text.trim())) return false;
+  if (/^jarvis\W*$/i.test(text.trim())) return false; // Jarvis's own name is someone talking to it, not a project
   const target = resolveOpenTarget(text.trim(), knownProjectTags());
   if (target.kind === "none") return false;
   if (target.kind === "ambiguous") {
@@ -1097,6 +1163,32 @@ function implicitOpen(text: string, active: SessionRecord[], ack: Ack, refuse: R
     return true;
   }
   openProject(target.tag, cleanInstruction(target.rest), text, active, ack, refuse);
+  return true;
+}
+
+// Small talk no session would take ("hey jarvis how are you", "thanks")
+// is Jarvis's to answer: a friendly line and where things stand. It never
+// becomes a picker or an instruction to a project. A message counts only if
+// every word is a pleasantry and it greets or thanks — "hey, fix the login
+// bug" is an instruction.
+const SMALL_TALK_WORDS = new Set(
+  ("hi hey hello hiya yo jarvis there how are you doing going is it whats what's up sup good morning afternoon " +
+    "evening night thanks thank ty cheers great nice cool awesome ok okay buddy mate today all well fine and so much a lot").split(" "),
+);
+const SMALL_TALK_ANCHOR = /\b(hi|hey|hello|hiya|yo|thanks|thank|ty|cheers|morning|afternoon|evening|how are you)\b/i;
+
+function smallTalk(text: string, active: SessionRecord[], ack: Ack): boolean {
+  const words = text.toLowerCase().match(/[a-z']+/g) ?? [];
+  if (!words.length || !words.every((w) => SMALL_TALK_WORDS.has(w)) || !SMALL_TALK_ANCHOR.test(text)) return false;
+  echoUser(text);
+  const waiting = listPendingPermissions().length;
+  const projects = new Set(active.map((s) => s.project_tag)).size;
+  const where = `${projects ? `${projects} project${projects > 1 ? "s" : ""} open` : "No projects open"}, ${
+    waiting ? `${waiting} request${waiting > 1 ? "s" : ""} waiting on you` : "nothing waiting on you"
+  }.`;
+  const opener = /\b(thanks|thank|ty|cheers)\b/i.test(text) ? "Any time." : "Hi! Doing well.";
+  say(`${opener} ${where} Name a project to send it something, or say "open <project> …".`);
+  ack(true, { action: "small_talk" });
   return true;
 }
 

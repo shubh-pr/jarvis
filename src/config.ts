@@ -26,4 +26,8 @@ export const config = {
   googleTokenPath: process.env.GOOGLE_TOKEN_PATH ?? "./google-token.json",
   googleChatApiBase: process.env.GOOGLE_CHAT_API_BASE ?? "https://chat.googleapis.com",
   googleChatTimeoutMs: Number(process.env.GOOGLE_CHAT_TIMEOUT_MS ?? 15_000),
+  // Jarvis's own chat for messages no session takes (agent/jarvisChat.ts).
+  chatEnabled: process.env.JARVIS_CHAT !== "off",
+  chatCommand: process.env.JARVIS_CHAT_COMMAND ?? "claude",
+  chatModel: process.env.JARVIS_CHAT_MODEL ?? "sonnet",
 };

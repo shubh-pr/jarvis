@@ -76,6 +76,30 @@ fs.writeFileSync(
   { mode: 0o755 },
 );
 
+// Stand-in for Jarvis's chat call (agent/jarvisChat.ts): answers like
+// `claude -p --output-format json --json-schema`, picking a reply from the
+// last line of the prompt, and logs its arguments and folder.
+const FAKE_CHAT = path.join(FAKE_BIN, "fake-chat.mjs");
+const FAKE_CHAT_LOG = path.join(TMP, "chat-invocations.log");
+fs.writeFileSync(
+  FAKE_CHAT,
+  `#!/usr/bin/env node
+import fs from "node:fs";
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.FAKE_CHAT_LOG, JSON.stringify({ cwd: process.cwd(), args }) + "\\n");
+const prompt = args[args.indexOf("-p") + 1] ?? "";
+const said = prompt.trim().split("\\n").pop().replace(/^User: /, "").toLowerCase();
+if (said.includes("make it fail")) process.exit(1);
+let out = { reply: "Haan bhai, bolo kya kaam hai?" };
+if (said.includes("kong")) out = { reply: "auth-central handles that. Tap to send it.", suggest: { projects: ["auth-central"], instruction: "Check the Kong header handling" } };
+if (said.includes("somewhere")) out = { reply: "Hmm.", suggest: { projects: ["no-such-project"], instruction: "do it" } };
+process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: JSON.stringify(out), structured_output: out }));
+`,
+  { mode: 0o755 },
+);
+const chatInvocations = (): { cwd: string; args: string[] }[] =>
+  fs.existsSync(FAKE_CHAT_LOG) ? fs.readFileSync(FAKE_CHAT_LOG, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+
 const FAKE_CLAUDE_HOLD = path.join(TMP, "claude-hold");
 const holdClaude = () => fs.writeFileSync(FAKE_CLAUDE_HOLD, "");
 const releaseClaude = () => fs.rmSync(FAKE_CLAUDE_HOLD, { force: true });
@@ -141,6 +165,7 @@ async function startServer(opts: { port?: number; dbPath?: string; env?: Record<
       FAKE_CLAUDE_LOG,
       FAKE_CLAUDE_HOLD,
       PATH: `${FAKE_BIN}:${process.env.PATH}`,
+      JARVIS_CHAT: "off", // scenario 27 turns it on, with the fake
       ...opts.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -1074,7 +1099,7 @@ async function scenarioContainsOpen() {
       `${describeAck(ack11)}; said=${JSON.stringify(said11)}`);
 
     const ack12 = await c.request({ type: "chat", content: "test" });
-    const said12 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    const said12 = c.latest((e) => e.tag === "jarvis" && e.type === "chat" && String(e.content).startsWith("Say what you want"))?.content ?? "";
     check("23.12 the same word on its own does name the project ('test' → jarvis-test, which asks what to do)",
       ack12?.reason === "needs_instruction" && said12.includes('"jarvis-test"') && claudeInvocations().length === 0,
       `${describeAck(ack12)}; said=${JSON.stringify(said12)}`);
@@ -1110,19 +1135,23 @@ async function scenarioSentenceRouting() {
     registerProjectDirect(srv.dbPath, "Identica-360", cwd.identica);
     registerProjectDirect(srv.dbPath, "hrms-ui-code", cwd.hrms);
 
-    // History in five projects, then those sessions end. "rbac" is in two
+    // History in five projects, then those sessions end. "rbac" recurs in two
     // projects' history, "kong" in one; "tests" and "logs" are in three, so
-    // they say nothing about which project is meant.
+    // they say nothing about which project is meant; "theme" is in just one
+    // message, so it isn't a topic.
     const seed: [string, string, string[]][] = [
-      ["h-auth", cwd.auth, ["add RBAC checks to the Kong plugin", "validate token headers coming from Kong"]],
-      ["h-identity", cwd.identity, ["RBAC roles for identity users"]],
+      ["h-auth", cwd.auth, ["add RBAC checks to the Kong plugin", "validate token headers coming from Kong", "RBAC rules for admins"]],
+      ["h-identity", cwd.identity, ["RBAC roles for identity users", "RBAC migration for old users", "hey quick one about the theme"]],
       ["h-kafka", cwd.kafka, ["run the tests for the consumer", "check the logs"]],
       ["h-zeta", cwd.zeta, ["run the tests again", "tail the logs"]],
       ["h-comms", cwd.comms, ["send the welcome emails", "fix the tests and the logs"]],
     ];
     for (const [id, dirPath, prompts] of seed) {
       await sessionStartHook(srv.port, id, dirPath);
-      for (const prompt of prompts) await userPromptSubmitHook(srv.port, id, dirPath, prompt);
+      for (const prompt of prompts) {
+        await userPromptSubmitHook(srv.port, id, dirPath, prompt);
+        await stopHook(srv.port, id, dirPath); // each prompt its own turn, as in a real terminal
+      }
       markSessionDone(srv.dbPath, id);
     }
     // Two projects running and no reply target: free text reaches no session.
@@ -1178,6 +1207,24 @@ async function scenarioSentenceRouting() {
     check("25.8 a sentence with nothing distinctive keeps today's 'Which project?' refusal",
       ack8?.reason === "unroutable" && said().startsWith("Which project? Active:") && claudeInvocations().length === 0,
       `${describeAck(ack8)}; said=${JSON.stringify(said())}`);
+
+    const ack10 = await c.request({ type: "chat", content: "hey jarvis how are you" });
+    check("25.10 small talk gets a reply from Jarvis — no picker, nothing sent to any project",
+      ack10?.ok === true && ack10?.action === "small_talk" && said().startsWith("Hi! Doing well.") && /\d+ projects open, nothing waiting on you/.test(said()) &&
+        claudeInvocations().length === 0,
+      `${describeAck(ack10)}; said=${JSON.stringify(said())}`);
+
+    const ack11 = await c.request({ type: "chat", content: "thanks jarvis" });
+    const thanks = c.latest((e) => e.tag === "jarvis" && e.type === "chat" && String(e.content).startsWith("Any time."));
+    check("25.11 thanks gets a reply too", ack11?.action === "small_talk" && !!thanks, `${describeAck(ack11)}; said=${JSON.stringify(said())}`);
+
+    const ack12 = await c.request({ type: "chat", content: "what about the theme" });
+    check("25.12 a word in only one message of a project's history isn't a topic — no picker, today's refusal",
+      ack12?.reason === "unroutable" && claudeInvocations().length === 0, `${describeAck(ack12)}; said=${JSON.stringify(said())}`);
+
+    const ack13 = await c.request({ type: "chat", content: "hey can you look at the kong plugin" });
+    check("25.13 a greeting with an instruction in it isn't small talk — it's routed as usual (here: the picker)",
+      ack13?.reason === "ambiguous" && tagsOf(ack13) === "auth-central" && claudeInvocations().length === 0, describeAck(ack13));
 
     const ack9 = await c.request({ type: "chat", content: "back to the identity RBAC work", replyToSession: { sessionId: "live-zeta", changedMsAgo: 5000 } });
     await until(() => claudeInvocations().length > 0, 2000);
@@ -1240,6 +1287,138 @@ async function scenarioPlanUsage() {
     const after = c2.latest((e) => e.type === "usage");
     check("26.6 the last numbers survive a restart", after?.fiveHour?.usedPercentage === 23.5 && after?.sevenDay?.usedPercentage === 44, JSON.stringify(after));
     c2.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
+async function scenarioJarvisChat() {
+  resetClaudeLog();
+  fs.rmSync(FAKE_CHAT_LOG, { force: true });
+  const srv = await startServer({ env: { JARVIS_CHAT: "on", JARVIS_CHAT_COMMAND: FAKE_CHAT, FAKE_CHAT_LOG } });
+  try {
+    const c = await Client.open(srv.port, await login(srv.port));
+    const authCentral = fs.realpathSync(projectDir("s27", "auth-central"));
+    registerProjectDirect(srv.dbPath, "auth-central", authCentral);
+    registerProjectDirect(srv.dbPath, "jarvis-test", fs.realpathSync(projectDir("s27", "jarvis-test")));
+    await sessionStartHook(srv.port, "s27-zeta", projectDir("s27", "zeta"));
+    await sessionStartHook(srv.port, "s27-kafka", projectDir("s27", "kafka-suite"));
+    resetClaudeLog();
+    const jarvisSaid = () => c.latest((e) => e.tag === "jarvis" && e.type === "chat");
+    const nextReply = async (after: number) => until(() => c.events.slice(after).find((e) => e.tag === "jarvis" && e.type === "chat"), 3000);
+
+    let mark = c.events.length;
+    const ack1 = await c.request({ type: "chat", content: "jarvis bhai" });
+    const reply1 = await nextReply(mark);
+    const typing = c.events.slice(mark).filter((e) => e.type === "jarvis_typing").map((e) => e.on);
+    const echoed = c.events.slice(mark).find((e) => e.direction === "in" && e.content === "jarvis bhai");
+    check("27.1 a message no session takes gets a real reply from Jarvis's chat — 'thinking' shown meanwhile, nothing sent to a project",
+      ack1?.ok === true && ack1?.action === "chat" && reply1?.content === "Haan bhai, bolo kya kaam hai?" && echoed?.toJarvis === true &&
+        typing[0] === true && typing.at(-1) === false && claudeInvocations().length === 0,
+      `${describeAck(ack1)}; reply=${JSON.stringify(reply1)}; typing=${JSON.stringify(typing)}`);
+
+    const call = chatInvocations()[0];
+    check("27.2 the chat call has no tools, saves no session, loads no MCP servers, and runs outside every project",
+      !!call && call.args[call.args.indexOf("--tools") + 1] === "" && call.args.includes("--no-session-persistence") &&
+        call.args.includes("--strict-mcp-config") && call.args.includes("--json-schema") && !call.cwd.includes("/s27/"),
+      JSON.stringify(call));
+
+    mark = c.events.length;
+    const ack3 = await c.request({ type: "chat", content: "jarvis" });
+    const reply3 = await nextReply(mark);
+    check("27.3 'jarvis' alone is someone talking to Jarvis — not 'open jarvis-test'",
+      ack3?.action === "chat" && !!reply3 && claudeInvocations().length === 0, `${describeAck(ack3)}; reply=${JSON.stringify(reply3)}`);
+
+    mark = c.events.length;
+    await c.request({ type: "chat", content: "can you look into the kong stuff" });
+    const reply4 = await nextReply(mark);
+    check("27.4 a request for work comes back as a picker showing the exact instruction a tap would send — nothing sent yet",
+      typeof reply4?.choiceId === "string" && reply4?.choices?.length === 1 && reply4.choices[0].tag === "auth-central" &&
+        reply4.content.includes("“Check the Kong header handling”") && claudeInvocations().length === 0,
+      JSON.stringify(reply4));
+
+    const ack5 = await c.request({ type: "chat", content: "1", openChoice: reply4?.choiceId });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv5 = claudeInvocations();
+    check("27.5 tapping it opens that project with that instruction",
+      ack5?.action === "launching" && inv5.length === 1 && inv5[0].startsWith(`cwd=${authCentral} `) && inv5[0].includes("--print Check the Kong header handling"),
+      `claude invoked: ${JSON.stringify(inv5)}; ${describeAck(ack5)}`);
+    resetClaudeLog();
+
+    mark = c.events.length;
+    await c.request({ type: "chat", content: "do it somewhere" });
+    const reply6 = await nextReply(mark);
+    check("27.6 a suggestion naming a project that doesn't exist is dropped — just the reply, no picker",
+      reply6?.content === "Hmm." && !reply6?.choiceId, JSON.stringify(reply6));
+
+    mark = c.events.length;
+    await c.request({ type: "chat", content: "make it fail please" });
+    const reply7 = await nextReply(mark);
+    check("27.7 if Claude can't be reached, you get the refusal you'd have had without chat",
+      !!reply7?.content.startsWith("I couldn't reach Claude for a reply just now. Which project? Active:") && claudeInvocations().length === 0,
+      JSON.stringify(reply7));
+    void jarvisSaid;
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
+async function scenarioInterruptingDeny() {
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const c = await Client.open(srv.port, await login(srv.port));
+    const cwd = projectDir("s28", "auth-svc");
+    const to = { sessionId: "s28-auth", changedMsAgo: 5000 };
+    const turnOf = () => c.latest((e) => e.type === "turns")?.sessions?.find((t: any) => t.sessionId === "s28-auth");
+
+    // A terminal turn is running; a tool is in flight and asks for approval.
+    await stopHook(srv.port, "s28-auth", cwd);
+    await userPromptSubmitHook(srv.port, "s28-auth", cwd, "clean up the logging");
+    resetClaudeLog();
+    const ackQ = await c.request({ type: "chat", content: "after that, look at auth central", replyToSession: to });
+    check("28.1 a message for the busy session waits in the queue", ackQ?.action === "queued", describeAck(ackQ));
+    const h1 = permissionHook(srv.port, "s28-auth", cwd, "sed -i demote-logs");
+    const id1 = await c.toolUseIdFor("s28-auth", "sed -i demote-logs");
+
+    const deniedTurn = turnOf()?.startedAt;
+    await c.request({ type: "decision", toolUseID: id1, decision: "deny" });
+    await until(() => h1.settled, 1000);
+    const stillBusy = turnOf()?.startedAt === deniedTurn;
+    await until(() => claudeInvocations().length > 0, 4000);
+    const inv = claudeInvocations();
+    // (The queued message then starts a fresh turn, so "working" is that one.)
+    check("28.2 Deny stops Claude's turn, which sends no Stop — Jarvis ends that turn itself, so it isn't shown working forever",
+      h1.behavior() === "deny" && typeof deniedTurn === "number" && stillBusy && turnOf()?.startedAt !== deniedTurn,
+      `behavior=${h1.behavior()} denied=${deniedTurn} busyRightAfter=${stillBusy} turnNow=${JSON.stringify(turnOf())}`);
+    check("28.3 …and the queued message goes in",
+      inv.length === 1 && inv[0].includes("--resume s28-auth") && inv[0].includes("after that, look at auth central"), `claude invoked: ${JSON.stringify(inv)}`);
+
+    // Free-text guidance denies the tool but Claude carries on: the turn stays.
+    await stopHook(srv.port, "s28-auth", cwd);
+    await userPromptSubmitHook(srv.port, "s28-auth", cwd, "now the tests");
+    const h2 = permissionHook(srv.port, "s28-auth", cwd, "mvn test");
+    await c.toolUseIdFor("s28-auth", "mvn test");
+    await sleep(FRESH_GUARD_WAIT_MS);
+    resetClaudeLog();
+    await c.request({ type: "chat", content: "use the offline flag instead", replyToSession: to });
+    await until(() => h2.settled, 1000);
+    await sleep(2200);
+    check("28.4 guidance (a typed reply that isn't 'no') doesn't end the turn — Claude goes on with it",
+      h2.behavior() === "deny" && !!turnOf() && claudeInvocations().length === 0, `behavior=${h2.behavior()} turn=${JSON.stringify(turnOf())}`);
+
+    // A Stop that arrives anyway is fine, and a new turn started meanwhile isn't cut short.
+    const h3 = permissionHook(srv.port, "s28-auth", cwd, "rm -rf target");
+    const id3 = await c.toolUseIdFor("s28-auth", "rm -rf target");
+    await c.request({ type: "decision", toolUseID: id3, decision: "deny" });
+    await until(() => h3.settled, 1000);
+    await stopHook(srv.port, "s28-auth", cwd);
+    await userPromptSubmitHook(srv.port, "s28-auth", cwd, "a brand new turn");
+    await sleep(2200);
+    check("28.5 if a Stop and a new turn arrive before Jarvis steps in, the new turn isn't ended by mistake",
+      !!turnOf(), JSON.stringify(turnOf()));
+    c.close();
   } finally {
     await killServer(srv);
   }
@@ -2545,6 +2724,8 @@ async function main() {
     ["24. Working indicator; activity hooks only ever observe", scenarioActivity],
     ["25. Sentences resolve to a project without guessing", scenarioSentenceRouting],
     ["26. Plan usage from the status line", scenarioPlanUsage],
+    ["27. Talking to Jarvis", scenarioJarvisChat],
+    ["28. Deny ends the turn", scenarioInterruptingDeny],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;
