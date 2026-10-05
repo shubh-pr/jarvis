@@ -21,6 +21,7 @@ import {
 import { resolvePermission, listPendingPermissions } from "./permissions.js";
 import { validateAnswers, answersFromText, describeAnswers } from "./questions.js";
 import { findContact, createDraft, getDraft, updateDraft, cleanDraftText, sendToChat, DRAFT_PROMPT } from "./chatSend.js";
+import { projectsDiscussing } from "./search.js";
 import { broadcast, registerConnectSnapshot, type InboundMessage, type Reply } from "../wsServer.js";
 import { config } from "../config.js";
 import { adapterFor, getAdapter } from "./adapters/index.js";
@@ -946,7 +947,7 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
   }
 
   if (active.length === 0) {
-    if (implicitOpen(text, active, ack, refuse)) return;
+    if (implicitOpen(text, active, ack, refuse) || sentenceOpen(text, active, ack, refuse)) return;
     echoUser(text);
     refuse("unroutable", "No projects are currently active. Start a claude session in a watched project first.");
     return;
@@ -964,7 +965,7 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
         ? active[0]
         : undefined;
   if (!session) {
-    if (implicitOpen(text, active, ack, refuse)) return;
+    if (implicitOpen(text, active, ack, refuse) || sentenceOpen(text, active, ack, refuse)) return;
     echoUser(text);
     const projects = [...new Set(active.map((s) => s.project_tag))].join(", ");
     refuse("unroutable", `Which project? Active: ${projects}.`);
@@ -996,6 +997,18 @@ type OpenTarget =
   | { kind: "ambiguous"; candidates: { tag: string; cwd?: string }[]; rest: string }
   | { kind: "none" };
 
+// Folder names that differ from the tag they were registered under, and the
+// tags of the projects in a folder by that name.
+function projectsByFolder(): Map<string, string[]> {
+  const byFolder = new Map<string, string[]>();
+  for (const p of listProjects()) {
+    const folder = path.basename(p.cwd);
+    if (folder === p.tag) continue;
+    byFolder.set(folder, [...(byFolder.get(folder) ?? []), p.tag]);
+  }
+  return byFolder;
+}
+
 function resolveOpenTarget(afterVerb: string, known: string[]): OpenTarget {
   const cwdOf = (tag: string) => findLaunchableCwd(tag);
   const restWithout = (spans: TagMatch[]) => {
@@ -1013,12 +1026,7 @@ function resolveOpenTarget(afterVerb: string, known: string[]): OpenTarget {
   // No tag named outright — try the folder name. A project may have been
   // disambiguated at registration ("payments-api", "api (NOBLEABLE-BE)"),
   // but "api" is still what you'd naturally type.
-  const byFolder = new Map<string, string[]>();
-  for (const p of listProjects()) {
-    const folder = path.basename(p.cwd);
-    if (folder === p.tag) continue;
-    byFolder.set(folder, [...(byFolder.get(folder) ?? []), p.tag]);
-  }
+  const byFolder = projectsByFolder();
   const folderMatches = findAllMentionedTags(afterVerb, [...byFolder.keys()]);
   if (folderMatches.length > 0) {
     const tagsForMatches = [...new Set(folderMatches.flatMap((m) => byFolder.get(m.tag)!))];
@@ -1092,6 +1100,51 @@ function implicitOpen(text: string, active: SessionRecord[], ack: Ack, refuse: R
   return true;
 }
 
+// A sentence no session can take ("let's look at auth-central", "back to
+// the identity RBAC work"), resolved without guessing:
+// - it names exactly one registered project by its full tag or folder name,
+//   and that name can't be an ordinary word (it has a hyphen, digit, space
+//   or bracket: "auth-central", not "identity") → go there, as "open" would;
+// - it names several → the picker;
+// - it names one only by a plain word, or none → that project (if any) plus
+//   the projects whose history mentions its distinctive words ("RBAC"),
+//   always through the picker, even when there's just one.
+// Otherwise the caller's refusal stands. Wherever it ends up, the whole
+// message is the instruction.
+function sentenceOpen(text: string, active: SessionRecord[], ack: Ack, refuse: Refuse): boolean {
+  const known = knownProjectTags();
+  let spans = findAllMentionedTags(text, known);
+  let named = spans.map((m) => ({ name: m.tag, tags: [m.tag] }));
+  if (!named.length) {
+    const byFolder = projectsByFolder();
+    spans = findAllMentionedTags(text, [...byFolder.keys()]);
+    named = spans.map((m) => ({ name: m.tag, tags: byFolder.get(m.tag)! }));
+  }
+  const namedTags = [...new Set(named.flatMap((n) => n.tags))];
+  if (namedTags.length === 1 && named.every((n) => !/^\p{L}+$/u.test(n.name))) {
+    openProject(namedTags[0], text.trim(), text, active, ack, refuse);
+    return true;
+  }
+  // A plain-word name is weak evidence, so history gets a say alongside it.
+  // The project's own name is left out of that search — it's already a
+  // candidate, and requiring it would hide the others.
+  let unnamed = text;
+  for (const m of [...spans].sort((a, b) => b.start - a.start)) unnamed = unnamed.slice(0, m.start) + unnamed.slice(m.end);
+  const fromHistory = namedTags.length > 1 ? [] : projectsDiscussing(unnamed).filter((tag) => known.includes(tag));
+  const candidates = [...new Set([...namedTags, ...fromHistory])];
+  if (!candidates.length) return false;
+  echoUser(text);
+  const lead = namedTags.length > 1
+    ? "That names more than one project."
+    : candidates.length === 1
+      ? `Did you mean ${candidates[0]}?`
+      : namedTags.length
+        ? `Did you mean ${namedTags[0]}, or one your history suggests?`
+        : "From your history, this sounds like one of these.";
+  offerOpenChoice(candidates.map((tag) => ({ tag, cwd: findLaunchableCwd(tag) })), text.trim(), refuse, lead);
+  return true;
+}
+
 // A reply answering an open-choice list: a number ("2", "2 check the logs"),
 // a tapped option, or the option's full name. Anything typed after the pick
 // replaces the original instruction. A reply that doesn't pick exactly one
@@ -1105,11 +1158,22 @@ function handleOpenChoice(choiceId: string, text: string, active: SessionRecord[
     return;
   }
 
+  // "no" drops the list; "yes" accepts a list of one ("Did you mean identity?").
+  if (NO_RE.test(text.trim())) {
+    openChoices.delete(choiceId);
+    echoUser(text);
+    say("Okay — nothing opened or sent.");
+    ack(true, { action: "choice_dismissed" });
+    return;
+  }
+
   let picked: string | undefined;
   let narrowed: string[] | undefined;
   let rest = "";
   const numbered = /^#?(\d+)(?:[.):]|\s|$)\s*([\s\S]*)$/.exec(text.trim());
-  if (numbered) {
+  if (choice.candidates.length === 1 && YES_RE.test(text.trim())) {
+    picked = choice.candidates[0];
+  } else if (numbered) {
     picked = choice.candidates[Number(numbered[1]) - 1];
     rest = numbered[2];
   } else {

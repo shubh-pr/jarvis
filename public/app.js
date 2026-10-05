@@ -303,7 +303,7 @@ function renderReplyTarget() {
   replyTargetEl.classList.toggle("hidden", !replyTarget && !openChoice);
   replyTargetEl.classList.toggle("choosing", !!openChoice);
   replyTargetLabel.textContent = openChoice
-    ? `Choosing which project to open — reply 1–${openChoice.count}`
+    ? `Choosing which project to open — reply ${openChoice.count === 1 ? "1 or yes" : `1–${openChoice.count}`}`
     : replyTarget
       ? `Replying to ${replyTarget.projectTag}`
       : "";
