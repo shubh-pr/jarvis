@@ -26,6 +26,14 @@ export function describeRequest(toolName: string, input: any, cwd: string): Requ
       return { title: `Search the web for "${String(input?.query ?? "")}"`, tags: ["goes online"] };
     case "Read":
       return { title: `Read ${shortPath(input?.file_path, cwd)}`, tags: [], detail: input?.file_path };
+    case "Agent":
+    case "Task": {
+      const who = typeof input?.subagent_type === "string" && input.subagent_type ? `${input.subagent_type} agent` : "a subagent";
+      const what = typeof input?.description === "string" && input.description.trim() ? `: ${sentence(input.description)}` : "";
+      return { title: `Start ${who}${what}`, tags: [] };
+    }
+    case "TodoWrite":
+      return { title: "Update its to-do list", tags: [] };
     case "Glob":
     case "Grep":
       return { title: `Search files for ${JSON.stringify(input?.pattern ?? "")}`, tags: [], detail: input?.path };

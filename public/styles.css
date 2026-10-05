@@ -481,3 +481,20 @@ header button { white-space: nowrap; }
 .draft-btn.primary { background: var(--ok); color: #052e14; }
 .draft-btn.secondary { background: var(--surface-2); color: var(--text); flex: 0 0 30%; }
 .draft-btn:disabled { opacity: 0.45; cursor: default; }
+
+/* ---- working indicator ---- */
+#activity { padding: 8px 16px 10px; border-top: 1px solid var(--surface-2); display: flex; flex-direction: column; gap: 8px; font-size: 0.8rem; color: var(--text-dim); }
+.activity-turn { display: flex; flex-direction: column; gap: 3px; }
+.activity-head { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.activity-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0; animation: activity-pulse 1.2s ease-in-out infinite; }
+.activity-turn.waiting .activity-dot { background: var(--danger); animation: none; }
+.activity-turn.quiet .activity-dot { background: #fbbf24; animation: none; }
+.activity-line { padding-left: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.activity-line.dim { opacity: 0.75; font-style: italic; }
+.activity-agent { color: var(--accent); }
+.activity-note { padding-left: 16px; color: #fbbf24; }
+@keyframes activity-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .activity-dot { animation: none; } }
+#working-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 5px 12px; font-size: 0.75rem; color: var(--text-dim); border-bottom: 1px solid var(--surface-2); }
+.working-chip { border: none; background: rgba(56, 189, 248, 0.12); color: var(--accent); border-radius: 999px; padding: 1px 8px; font-size: 0.74rem; cursor: pointer; }
+.badge.working { background: rgba(56, 189, 248, 0.12); color: var(--accent); }

@@ -8,7 +8,8 @@ import { installProject } from "./install.js";
 // Claude Code. Sessions report in through the hooks installProject writes
 // (SessionStart, UserPromptSubmit, PermissionRequest — an http hook that
 // holds the tool call until Jarvis answers, which is what meets the
-// full-control standard — and Stop). New turns are separate
+// full-control standard — Stop, and the observe-only activity hooks
+// PreToolUse / PostToolUse / PostToolUseFailure). New turns are separate
 // `claude --print` processes.
 //
 // Jarvis's own runs are pinned to the default permission mode, so nothing
@@ -41,6 +42,9 @@ export const claude: AgentAdapter = {
     toolInput: body.tool_input ?? {},
     transcriptRef: body.transcript_path,
     prompt: body.prompt,
+    toolUseId: typeof body.tool_use_id === "string" ? body.tool_use_id : undefined,
+    // Present on hooks fired by a subagent's own tool calls.
+    subagent: typeof body.agent_id === "string" ? { id: body.agent_id, type: String(body.agent_type ?? "subagent") } : undefined,
   }),
 
   // Answers to an AskUserQuestion travel in the tool's input; a plain

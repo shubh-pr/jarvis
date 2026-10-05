@@ -11,7 +11,7 @@ import {
 import { registerPendingPermission, cancelPermission } from "../agent/permissions.js";
 import { notify } from "../notifier.js";
 import { deriveProjectTag } from "./projectTag.js";
-import { onTurnEnded, onTurnActivity, isJarvisTurn } from "../agent/router.js";
+import { onTurnEnded, onTurnActivity, isJarvisTurn, onToolStart, onToolEnd } from "../agent/router.js";
 import { questionContent } from "../agent/questions.js";
 import { summaryText } from "../agent/describe.js";
 import type { AgentAdapter, Decision } from "../agent/adapters/index.js";
@@ -108,6 +108,27 @@ export async function handlePermissionRequest(
   const decision = await decisionPromise;
   if (!decision) return null; // cancelled — the caller has already gone away
   return adapter.formatDecision(decision, toolInput);
+}
+
+// Activity (PreToolUse, and PostToolUse / PostToolUseFailure). Observe-only:
+// these return nothing, and the route has already sent its fixed empty reply
+// before calling them (index.ts), so nothing here can ever answer for you.
+// They only update the live working indicator — no history, no push.
+export function handleToolStart(adapter: AgentAdapter, body: any): void {
+  const { sessionId, cwd, toolName, toolInput, toolUseId, subagent } = adapter.parseEvent(body);
+  if (!sessionId || !cwd || !toolName) return;
+  // A session seen for the first time here gets stored like any other, so the
+  // indicator can file it under its project.
+  const projectTag = resolveProjectTag(sessionId, cwd);
+  if (!getSession(sessionId)) upsertSession(sessionId, projectTag, "running", { cwd, agent: adapter.id });
+  const { title } = adapter.describeTool(toolName, toolInput ?? {}, getSession(sessionId)?.cwd ?? cwd);
+  onToolStart(sessionId, projectTag, { toolUseId, title, agentId: subagent?.id, agentType: subagent?.type });
+}
+
+export function handleToolEnd(adapter: AgentAdapter, body: any): void {
+  const { sessionId, toolUseId } = adapter.parseEvent(body);
+  if (!sessionId) return;
+  onToolEnd(sessionId, toolUseId);
 }
 
 function sleep(ms: number): Promise<void> {

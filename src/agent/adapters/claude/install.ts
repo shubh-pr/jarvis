@@ -8,6 +8,8 @@ import { defaultPermissions, mergePermissions } from "./permissionDefaults.js";
 // doesn't merge hook config from an ancestor directory into a repo beneath
 // it, so every repo gets its own. Returns the number of permission rules
 // added.
+const ACTIVITY_TIMEOUT_S = 3;
+
 export function installProject(projectPath: string, opts: InstallOptions): number {
   // UserPromptSubmit takes no matcher; it's written the way it was verified.
   const hookEntry = (eventPath: string, timeout: number, matcher: string | null = "*") => ({
@@ -37,6 +39,13 @@ export function installProject(projectPath: string, opts: InstallOptions): numbe
   addIfMissing("UserPromptSubmit", hookEntry("user-prompt-submit", 10, null)); // marks a turn as started
   addIfMissing("PermissionRequest", hookEntry("permission-request", 604800)); // 7 days
   addIfMissing("Stop", hookEntry("stop", 30));
+  // Activity: observe-only. PreToolUse holds every tool call until it's
+  // answered, so it gets a short timeout — a stuck Jarvis must not stall
+  // Claude for the 10-minute default — and Jarvis always answers it at once,
+  // with an empty reply.
+  addIfMissing("PreToolUse", hookEntry("pre-tool-use", ACTIVITY_TIMEOUT_S));
+  addIfMissing("PostToolUse", hookEntry("post-tool-use", ACTIVITY_TIMEOUT_S));
+  addIfMissing("PostToolUseFailure", hookEntry("post-tool-use", ACTIVITY_TIMEOUT_S));
 
   const added = opts.withPermissions ? mergePermissions(settings, defaultPermissions(projectPath, opts.readDirs)) : 0;
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");

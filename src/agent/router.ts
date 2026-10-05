@@ -114,8 +114,20 @@ interface Busy {
   lastActivity: number;
   nudged: boolean;
   draftId?: string; // this turn is Jarvis asking for a summary to send
+  startedAt: number;
+  tools: Map<string, RunningTool>; // tool calls in progress, by the agent's tool-use ID
 }
 const busy = new Map<string, Busy>();
+
+// A tool call reported by the agent's activity hooks (PreToolUse) and not yet
+// reported finished (PostToolUse / PostToolUseFailure). Live only: never
+// stored, never pushed.
+interface RunningTool {
+  title: string;
+  agentId?: string; // set when a subagent made the call
+  agentType?: string; // the subagent's name, e.g. "Explore"
+  startedAt: number;
+}
 
 // A message waiting for a busy session. Each has an ID so you can see it and
 // take it back before it sends; the queue here is what actually gets sent.
@@ -145,6 +157,58 @@ function broadcastQueue(): void {
 }
 registerConnectSnapshot(queueSnapshot);
 
+// ---- Turns in progress, for the "working" indicator ----
+// Every session with a turn running: when it started, when anything was last
+// heard from it, and — for agents that report activity — which tool calls are
+// running right now. `now` lets the phone correct for its clock differing
+// from this machine's. Sessions that have reported activity at least once
+// are flagged, so the phone only says "Thinking…" (no tool running) when
+// it would actually hear about a tool.
+const reportsActivity = new Set<string>();
+const TURNS_THROTTLE_MS = 400;
+let turnsTimer: ReturnType<typeof setTimeout> | null = null;
+
+function turnsSnapshot() {
+  return {
+    type: "turns",
+    now: Date.now(),
+    quietMs: config.busyNudgeMs,
+    sessions: [...busy.entries()].map(([sessionId, e]) => ({
+      sessionId,
+      projectTag: e.tag,
+      projectKey: getSession(sessionId)?.cwd ?? undefined,
+      kind: e.kind,
+      startedAt: e.startedAt,
+      lastActivity: e.lastActivity,
+      reportsActivity: reportsActivity.has(sessionId),
+      tools: [...e.tools.values()]
+        .sort((a, b) => a.startedAt - b.startedAt)
+        .map(({ title, agentId, agentType, startedAt }) => ({ title, agentId, agentType, startedAt })),
+    })),
+  };
+}
+registerConnectSnapshot(turnsSnapshot);
+
+// A turn starting or ending goes out at once; tool activity, which can come
+// in bursts of dozens, at most every TURNS_THROTTLE_MS.
+function broadcastTurns(now = false): void {
+  if (now) {
+    if (turnsTimer) clearTimeout(turnsTimer);
+    turnsTimer = null;
+    broadcast(turnsSnapshot());
+    return;
+  }
+  turnsTimer ??= setTimeout(() => {
+    turnsTimer = null;
+    broadcast(turnsSnapshot());
+  }, TURNS_THROTTLE_MS);
+}
+
+function endTurn(sessionId: string): void {
+  busy.delete(sessionId);
+  broadcastTurns(true);
+}
+
 function markBusy(sessionId: string, tag: string, kind: Busy["kind"]): string {
   const token = randomUUID();
   const existing = busy.get(sessionId);
@@ -155,7 +219,10 @@ function markBusy(sessionId: string, tag: string, kind: Busy["kind"]): string {
     token,
     lastActivity: Date.now(),
     nudged: false,
+    startedAt: Date.now(),
+    tools: new Map(),
   });
+  broadcastTurns(true);
   return token;
 }
 
@@ -177,7 +244,7 @@ function spawnResume(session: SessionRecord, text: string, draftId?: string): Ch
     setTimeout(() => {
       const entry = busy.get(session.id);
       if (!entry || entry.token !== token) return;
-      busy.delete(session.id);
+      endTurn(session.id);
       broadcastQueue();
       if (entry.draftId) draftReplyArrived(entry.draftId, undefined);
       if (entry.queued.length) {
@@ -212,7 +279,7 @@ function spawnFresh(tag: string, cwd: string, agent: string, instruction: string
     setTimeout(() => {
       const entry = busy.get(sessionId);
       if (!entry || entry.token !== token) return;
-      busy.delete(sessionId);
+      endTurn(sessionId);
       broadcastQueue();
       setSessionStatus(sessionId, "error");
       const lost = entry.queued.length
@@ -262,9 +329,60 @@ export function onTurnActivity(sessionId: string, tag: string): void {
   if (entry) {
     entry.lastActivity = Date.now();
     entry.nudged = false;
+    broadcastTurns();
     return;
   }
   markBusy(sessionId, tag, "turn");
+}
+
+// A tool call starting (the agent's PreToolUse). It proves a turn is running,
+// like a permission request — but only the main agent's: a subagent can keep
+// working after the turn's Stop (one run in the background), and that must
+// not make the session look busy, or messages would queue behind it.
+//
+// An agent runs its tool calls in batches — every call in a batch starts
+// together, and the next batch only starts once the last one has finished.
+// So a call from an agent whose newest running call started more than
+// BATCH_GAP_MS ago means that agent's earlier calls are over, even if their
+// "finished" never arrived (a denied call may not report one).
+const BATCH_GAP_MS = 1500;
+export function onToolStart(
+  sessionId: string,
+  tag: string,
+  tool: { toolUseId?: string; title: string; agentId?: string; agentType?: string },
+): void {
+  reportsActivity.add(sessionId);
+  if (!busy.has(sessionId)) {
+    if (tool.agentId) return;
+    markBusy(sessionId, tag, "turn");
+  }
+  const entry = busy.get(sessionId)!;
+  const now = Date.now();
+  entry.lastActivity = now;
+  entry.nudged = false;
+  const mine = [...entry.tools.entries()].filter(([, t]) => t.agentId === tool.agentId);
+  if (mine.length && now - Math.max(...mine.map(([, t]) => t.startedAt)) > BATCH_GAP_MS) {
+    for (const [id] of mine) entry.tools.delete(id);
+  }
+  entry.tools.set(tool.toolUseId ?? randomUUID(), {
+    title: tool.title,
+    agentId: tool.agentId,
+    agentType: tool.agentType,
+    startedAt: now,
+  });
+  broadcastTurns();
+}
+
+// A tool call finished, or failed (PostToolUse / PostToolUseFailure). Never
+// starts a turn.
+export function onToolEnd(sessionId: string, toolUseId?: string): void {
+  reportsActivity.add(sessionId);
+  const entry = busy.get(sessionId);
+  if (!entry) return;
+  entry.lastActivity = Date.now();
+  entry.nudged = false;
+  if (toolUseId) entry.tools.delete(toolUseId);
+  broadcastTurns();
 }
 
 // A turn's Stop hook: the session is free. A drafting turn's reply becomes
@@ -274,7 +392,7 @@ export function onTurnActivity(sessionId: string, tag: string): void {
 export function onTurnEnded(sessionId: string, lastText?: string): void {
   const entry = busy.get(sessionId);
   if (!entry) return;
-  busy.delete(sessionId);
+  endTurn(sessionId);
   if (entry.draftId) draftReplyArrived(entry.draftId, lastText);
   if (entry.queued.length) flush(sessionId, entry);
   else startWaitingDraft(sessionId);
@@ -454,7 +572,7 @@ function handleSendNow(text: string, replyToSession: string | undefined, ack: Ac
     return;
   }
   const [sessionId, entry] = candidates[0];
-  busy.delete(sessionId);
+  endTurn(sessionId);
   flush(sessionId, entry);
   ack(true, { action: "sent_now", sessionId });
 }

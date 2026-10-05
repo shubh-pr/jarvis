@@ -17,7 +17,7 @@ import { resolvePermission } from "./agent/permissions.js";
 import { handleInbound } from "./agent/router.js";
 import { listProjectHistories, projectBlocks, projectMessages } from "./agent/history.js";
 import { searchHistory } from "./agent/search.js";
-import { handleSessionStart, handleUserPromptSubmit, handlePermissionRequest, handleStop } from "./hooks/routes.js";
+import { handleSessionStart, handleUserPromptSubmit, handlePermissionRequest, handleStop, handleToolStart, handleToolEnd } from "./hooks/routes.js";
 import { adapterFor, getAdapter } from "./agent/adapters/index.js";
 
 // The hook URLs below are the ones watch-project has always written into
@@ -41,6 +41,35 @@ function readJsonBody(req: http.IncomingMessage): Promise<any> {
     req.on("error", reject);
   });
 }
+
+// An activity hook's body, or null if it can't be used. Unlike readJsonBody
+// it never rejects and never cuts the connection: an oversized body (a
+// PostToolUse can carry a large tool result) is read to the end and dropped,
+// so the agent still gets its normal empty reply.
+function readActivityBody(req: http.IncomingMessage): Promise<any | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size <= 2_000_000) chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (size > 2_000_000) return resolve(null);
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "null"));
+      } catch {
+        resolve(null);
+      }
+    });
+    req.on("error", () => resolve(null));
+  });
+}
+
+const ACTIVITY_HOOKS: Record<string, (adapter: typeof hookAgent, body: any) => void> = {
+  "/api/hooks/pre-tool-use": handleToolStart,
+  "/api/hooks/post-tool-use": handleToolEnd,
+};
 
 function sendJson(res: http.ServerResponse, status: number, data: unknown) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -174,6 +203,28 @@ const server = http.createServer((req, res) => {
         console.error("permission-request hook failed:", err);
         sendJson(res, 400, { error: "Invalid request body" });
       });
+    return;
+  }
+
+  // Observe-only activity hooks — see "Observe-only hooks" in ARCHITECTURE.md.
+  // PreToolUse holds the tool call until it gets a reply, and a decision in
+  // that reply would override your approvals. So the reply is fixed: 200 with
+  // an empty body (no output, no decision), sent before the event is even
+  // looked at, whatever the body holds — malformed, oversized or otherwise.
+  // A handler can't change it: it runs only after the reply has gone.
+  const activityHandler = req.method === "POST" ? ACTIVITY_HOOKS[req.url ?? ""] : undefined;
+  if (activityHandler) {
+    if (!requireHookAuth(req, res)) return;
+    readActivityBody(req).then((body) => {
+      res.writeHead(200);
+      res.end();
+      if (body === null) return;
+      try {
+        activityHandler(hookAgent, body);
+      } catch (err) {
+        console.error("activity hook failed:", err);
+      }
+    });
     return;
   }
 

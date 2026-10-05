@@ -38,6 +38,8 @@
       </header>
       <!-- Anything that needs you, from any project, stays visible on every screen. -->
       <div id="waiting-strip" class="hidden"></div>
+      <!-- Projects with a turn running, elsewhere. Just names: the live detail is in each project. -->
+      <div id="working-line" class="hidden"></div>
       <div id="search-panel" class="hidden">
         <input id="search-input" type="search" placeholder="Search all conversations…" autocomplete="off" />
         <div id="search-scope"></div>
@@ -54,6 +56,7 @@
         </div>
         <div id="viewing-bar" class="hidden"></div>
         <div id="messages"></div>
+        <div id="activity" class="hidden" aria-live="polite"></div>
       </div>
       <div id="queue-panel" class="hidden"></div>
       <div id="reply-target" class="hidden">
