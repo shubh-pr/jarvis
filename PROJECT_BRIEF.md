@@ -114,7 +114,7 @@ Jarvis receives callback → updates state → notifies phone → repeat
 
 - Voice (Phase 2).
 - Multi-user support (single operator).
-- Agents other than Claude Code (generalize later).
+- Agents other than Claude Code (generalize later). *(2026-10-05: all Claude Code–specific code now sits behind an adapter interface — `ARCHITECTURE.md`, "Agent adapters". That's structural cleanup only. It is not this generalization: there's no second agent, and Phase 1 is unchanged.)*
 - Tasks that genuinely need a long, uninterrupted-by-design compute run beyond GitHub Actions' hosted job limits (6 hrs) — flag this if it comes up; the fallback is Cloud Run Jobs, still serverless, no hard timeout.
 
 ## 6. Build order (please follow this sequence and check in after each milestone)

@@ -29,3 +29,16 @@ export function readLastAssistantText(transcriptPath: string): string | null {
   }
   return null;
 }
+
+// The folder the session was started in: the first transcript entry's cwd.
+export function readStartFolder(transcriptPath: string): string | undefined {
+  try {
+    const fd = fs.openSync(transcriptPath, "r");
+    const buf = Buffer.alloc(64 * 1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    return /"cwd":"((?:[^"\\]|\\.)*)"/.exec(buf.toString("utf8", 0, n))?.[1];
+  } catch {
+    return undefined;
+  }
+}

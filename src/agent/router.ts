@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ import {
   setSessionStatus,
   listProjects,
   findLaunchableCwd,
+  findLaunchTarget,
   registerProject,
   addMessage,
   editMessage,
@@ -22,6 +23,7 @@ import { validateAnswers, answersFromText, describeAnswers } from "./questions.j
 import { findContact, createDraft, getDraft, updateDraft, cleanDraftText, sendToChat, DRAFT_PROMPT } from "./chatSend.js";
 import { broadcast, registerConnectSnapshot, type InboundMessage, type Reply } from "../wsServer.js";
 import { config } from "../config.js";
+import { adapterFor, getAdapter } from "./adapters/index.js";
 import type { SessionRecord } from "../types.js";
 
 const LEGACY_TEST_SESSION_ID = "shell-test";
@@ -157,24 +159,19 @@ function markBusy(sessionId: string, tag: string, kind: Busy["kind"]): string {
   return token;
 }
 
-// Injects a turn into an existing session. Callers go through deliver(), so
-// this only runs when the session is free. Jarvis's own runs are pinned to
-// the default permission mode, so nothing it starts can auto-accept edits
-// or skip prompts, whatever a settings file says.
+// Injects a turn into an existing session, through the session's own agent
+// adapter. Callers go through deliver(), so this only runs when the session
+// is free.
 function spawnResume(session: SessionRecord, text: string, draftId?: string): ChildProcess {
   const token = markBusy(session.id, session.project_tag, "turn");
   if (draftId) busy.get(session.id)!.draftId = draftId;
-  const child = spawn("claude", ["--permission-mode", "default", "--resume", session.id, "--print", text], {
-    cwd: session.cwd!,
-    stdio: "ignore",
-    detached: true,
-  });
-  child.unref();
+  const adapter = adapterFor(session);
+  const child = adapter.resume({ sessionId: session.id, cwd: session.cwd!, text });
   child.on("error", (err) => {
     say(`Failed to reach "${session.project_tag}": ${err.message}`);
   });
   child.on("exit", (code) => {
-    if (code) say(`claude exited with code ${code} while handling your message for "${session.project_tag}".`);
+    if (code) say(`${adapter.command} exited with code ${code} while handling your message for "${session.project_tag}".`);
     // Stop is answered before the process can exit, so if this turn is
     // still marked busy it ended without one. The session is free again.
     setTimeout(() => {
@@ -195,26 +192,23 @@ function spawnResume(session: SessionRecord, text: string, draftId?: string): Ch
   return child;
 }
 
-// Originates a brand-new session — the one case where JARVIS runs `claude`
+// Originates a brand-new session — the one case where JARVIS runs an agent
 // somewhere it wasn't already running, rather than resuming one you started.
 // See ARCHITECTURE.md's "open <project>" note for why this is a deliberate
 // exception to "never spawns or owns agent sessions itself". Jarvis picks
-// the session ID, so the session is registered — and busy — at once.
-function spawnFresh(tag: string, cwd: string, instruction: string): string {
+// the session ID, so the session is registered — and busy — at once. The
+// project's agent runs it, and stays the session's agent from then on.
+function spawnFresh(tag: string, cwd: string, agent: string, instruction: string): string {
+  const adapter = getAdapter(agent);
   const sessionId = randomUUID();
-  upsertSession(sessionId, tag, "starting", { cwd });
+  upsertSession(sessionId, tag, "starting", { cwd, agent: adapter.id });
   const token = markBusy(sessionId, tag, "launch");
-  const child = spawn("claude", ["--permission-mode", "default", "--session-id", sessionId, "--print", instruction], {
-    cwd,
-    stdio: "ignore",
-    detached: true,
-  });
-  child.unref();
+  const child = adapter.launch({ sessionId, cwd, text: instruction });
   child.on("error", (err) => {
     say(`Failed to launch "${tag}": ${err.message}`);
   });
   child.on("exit", (code) => {
-    if (code) say(`claude exited with code ${code} while launching "${tag}".`);
+    if (code) say(`${adapter.command} exited with code ${code} while launching "${tag}".`);
     setTimeout(() => {
       const entry = busy.get(sessionId);
       if (!entry || entry.token !== token) return;
@@ -1012,15 +1006,15 @@ function openProject(tag: string, instruction: string, text: string, active: Ses
     return;
   }
 
-  const cwd = findLaunchableCwd(tag);
-  if (!cwd) {
+  const target = findLaunchTarget(tag);
+  if (!target) {
     echoUser(text, { projectTag: tag });
     refuse("unknown_project", `"${tag}" isn't watched yet — run \`npm run watch-project <path>\` for it first.`);
     return;
   }
 
-  registerProject(tag, cwd); // bumps last_used_at; self-heals if only known via an old session
-  const sessionId = spawnFresh(tag, cwd, instruction);
+  registerProject(tag, target.cwd, target.agent); // bumps last_used_at; self-heals if only known via an old session
+  const sessionId = spawnFresh(tag, target.cwd, target.agent, instruction);
   echoUser(text, { id: sessionId, projectTag: tag });
   ack(true, { action: "launching", projectTag: tag, sessionId });
 }

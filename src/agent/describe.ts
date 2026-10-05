@@ -1,9 +1,11 @@
 import path from "node:path";
 
-// A permission request in plain English, for the card and the push:
-// - `title`: what it wants to do. For Bash that's the one-line description
-//   Claude writes for every command — the clearest gist there is, but it's
-//   Claude's own claim, so it's never the only thing shown.
+// A permission request in plain English, for the card and the push. Each
+// agent adapter builds one from its own tool names (describeTool); the
+// pieces here are shared.
+// - `title`: what it wants to do. For a shell command that's the agent's own
+//   one-line description when it writes one — the clearest gist there is,
+//   but it's the agent's claim, so it's never the only thing shown.
 // - `tags`: Jarvis's own reading of the actual command — what kind of risk
 //   it carries — independent of what the description says.
 // - `detail`: the exact command or target, kept one tap away on the card.
@@ -28,24 +30,24 @@ const TAG_RULES: [RegExp, string, "bare" | "raw"][] = [
   [/(^|[\s;&|(])(python3?|node|ruby|perl|bash|sh|zsh)\s+(-c\b|-\s|<<|\S+\.(py|js|mjs|rb|pl|sh)\b)/, "runs a script", "bare"],
 ];
 
-function commandTags(command: string): string[] {
+export function commandTags(command: string): string[] {
   const bare = command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "''");
   const tags = TAG_RULES.filter(([re, , on]) => re.test(on === "bare" ? bare : command)).map(([, tag]) => tag);
   return [...new Set(tags)];
 }
 
-function sentence(text: string): string {
+export function sentence(text: string): string {
   const t = text.trim().replace(/\s+/g, " ").replace(/[.:]$/, "");
   return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
-function shortPath(p: unknown, cwd: string): string {
+export function shortPath(p: unknown, cwd: string): string {
   if (typeof p !== "string") return "a file";
   const rel = path.relative(cwd, p);
   return rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel : p;
 }
 
-function hostOf(url: unknown): string {
+export function hostOf(url: unknown): string {
   try {
     return new URL(String(url)).host || String(url);
   } catch {
@@ -53,8 +55,8 @@ function hostOf(url: unknown): string {
   }
 }
 
-// What a bare command is doing, when Claude didn't describe it.
-function guessBashTitle(command: string): string {
+// What a bare shell command is doing, when the agent didn't describe it.
+export function guessBashTitle(command: string): string {
   const first = command.trim().split(/\s+/)[0] ?? "";
   const known: Record<string, string> = {
     git: "Run a git command",
@@ -68,41 +70,6 @@ function guessBashTitle(command: string): string {
     node: "Run a Node script",
   };
   return known[first] ?? "Run a shell command";
-}
-
-export function describeRequest(toolName: string, input: any, cwd: string): RequestSummary {
-  switch (toolName) {
-    case "Bash": {
-      const command = String(input?.command ?? "");
-      const described = typeof input?.description === "string" && input.description.trim();
-      return {
-        title: described ? sentence(input.description) : guessBashTitle(command),
-        tags: commandTags(command),
-        detail: command,
-      };
-    }
-    case "Edit":
-    case "MultiEdit":
-      return { title: `Edit ${shortPath(input?.file_path, cwd)}`, tags: ["writes files"], detail: input?.file_path };
-    case "Write":
-      return { title: `Create or overwrite ${shortPath(input?.file_path, cwd)}`, tags: ["writes files"], detail: input?.file_path };
-    case "NotebookEdit":
-      return { title: `Edit notebook ${shortPath(input?.notebook_path, cwd)}`, tags: ["writes files"], detail: input?.notebook_path };
-    case "WebFetch":
-      return { title: `Open ${hostOf(input?.url)}`, tags: ["goes online"], detail: input?.url };
-    case "WebSearch":
-      return { title: `Search the web for "${String(input?.query ?? "")}"`, tags: ["goes online"] };
-    case "Read":
-      return { title: `Read ${shortPath(input?.file_path, cwd)}`, tags: [], detail: input?.file_path };
-    case "Glob":
-    case "Grep":
-      return { title: `Search files for ${JSON.stringify(input?.pattern ?? "")}`, tags: [], detail: input?.path };
-    default: {
-      const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
-      if (mcp) return { title: `Use ${mcp[2].replace(/_/g, " ")} (${mcp[1]})`, tags: [], detail: JSON.stringify(input) };
-      return { title: `Use ${toolName}`, tags: [], detail: JSON.stringify(input) };
-    }
-  }
 }
 
 // The same thing as one block of text: the chat log, push body, and any
