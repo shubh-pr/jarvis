@@ -1191,6 +1191,60 @@ async function scenarioSentenceRouting() {
   }
 }
 
+async function scenarioPlanUsage() {
+  const dbPath = path.join(TMP, `jarvis-usage-${crypto.randomUUID()}.db`);
+  let srv = await startServer({ dbPath });
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const report = (body: unknown, secret = HOOKS_SECRET) =>
+      fetch(`http://localhost:${srv.port}/api/hooks/usage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+        body: JSON.stringify(body),
+      });
+    const usage = () => c.latest((e) => e.type === "usage");
+    const now = Math.floor(Date.now() / 1000);
+    await until(() => usage(), 1500);
+
+    check("26.1 before any report, a phone connecting gets an empty usage snapshot (it shows how to get the bars)",
+      !!usage() && usage().fiveHour === undefined && usage().sevenDay === undefined, JSON.stringify(usage()));
+
+    const bad = await report({ rate_limits: { five_hour: { used_percentage: 10, resets_at: now + 3600 } } }, "wrong-secret");
+    await sleep(200);
+    check("26.2 a report without the hooks secret is refused and changes nothing", bad.status === 401 && usage().fiveHour === undefined, `status ${bad.status}`);
+
+    const ok = await report({ rate_limits: { five_hour: { used_percentage: 23.5, resets_at: now + 3600 }, seven_day: { used_percentage: 41, resets_at: now + 86400 } } });
+    const body = await ok.text();
+    await until(() => usage()?.fiveHour, 1000);
+    const u = usage();
+    check("26.3 a status-line report reaches the phone at once: both windows, percent used and reset time (ms)",
+      ok.status === 200 && body === "" && u.fiveHour?.usedPercentage === 23.5 && u.fiveHour?.resetsAt === (now + 3600) * 1000 &&
+        u.sevenDay?.usedPercentage === 41 && typeof u.updatedAt === "number",
+      `status ${ok.status} body=${JSON.stringify(body)} usage=${JSON.stringify(u)}`);
+
+    await report({ rate_limits: { five_hour: { used_percentage: 150, resets_at: now + 3600 }, seven_day: { used_percentage: "lots" } } });
+    await sleep(300);
+    check("26.4 nonsense values are ignored, never shown", usage().fiveHour.usedPercentage === 23.5 && usage().sevenDay.usedPercentage === 41, JSON.stringify(usage()));
+
+    await report({ rate_limits: { seven_day: { used_percentage: 44, resets_at: now + 86400 } } });
+    await until(() => usage()?.sevenDay?.usedPercentage === 44, 1000);
+    check("26.5 a report missing one window keeps that window's last numbers until it resets",
+      usage().sevenDay.usedPercentage === 44 && usage().fiveHour?.usedPercentage === 23.5, JSON.stringify(usage()));
+    c.close();
+
+    await killServer(srv);
+    srv = await startServer({ dbPath });
+    const c2 = await Client.open(srv.port, await login(srv.port));
+    await until(() => c2.latest((e) => e.type === "usage"), 1500);
+    const after = c2.latest((e) => e.type === "usage");
+    check("26.6 the last numbers survive a restart", after?.fiveHour?.usedPercentage === 23.5 && after?.sevenDay?.usedPercentage === 44, JSON.stringify(after));
+    c2.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
 function readPermissions(repo: string): { allow: string[]; ask: string[] } | undefined {
   const f = path.join(repo, ".claude", "settings.local.json");
   if (!fs.existsSync(f)) return undefined;
@@ -2490,6 +2544,7 @@ async function main() {
     ["23. Project names by contains-match", scenarioContainsOpen],
     ["24. Working indicator; activity hooks only ever observe", scenarioActivity],
     ["25. Sentences resolve to a project without guessing", scenarioSentenceRouting],
+    ["26. Plan usage from the status line", scenarioPlanUsage],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;

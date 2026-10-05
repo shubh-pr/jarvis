@@ -1,12 +1,12 @@
 {
-  "name": "JARVIS",
-  "short_name": "JARVIS",
+  "name": "Jarvis",
+  "short_name": "Jarvis",
   "description": "Chat/notification layer for your coding agents",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#0b0f14",
-  "theme_color": "#0b0f14",
+  "background_color": "#5b5bd6",
+  "theme_color": "#5b5bd6",
   "orientation": "portrait",
   "icons": [
     { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },

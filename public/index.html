@@ -3,18 +3,30 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>JARVIS</title>
-  <meta name="theme-color" content="#0b0f14" />
+  <title>Jarvis</title>
+  <meta name="theme-color" content="#f6f6f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0f0f11" media="(prefers-color-scheme: dark)" />
   <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="/icons/icon-192.png" />
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <!-- Shared by every Jarvis face on the page (app.js builds them). -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <linearGradient id="jarvis-face-fill" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#7c7cf0" />
+        <stop offset="100%" stop-color="#5151c9" />
+      </linearGradient>
+    </defs>
+  </svg>
   <div id="app">
     <div id="login-screen">
-      <h1>JARVIS</h1>
+      <span data-face></span>
+      <h1>Jarvis</h1>
       <input id="passcode-input" type="password" inputmode="text" placeholder="Passcode" autocomplete="off" />
       <button id="login-btn">Unlock</button>
       <div id="login-error"></div>
@@ -23,14 +35,15 @@
     <div id="chat-screen" class="hidden">
       <header>
         <div class="header-left">
-          <button id="back-btn" class="hidden" aria-label="All projects">‹</button>
+          <button id="back-btn" class="hidden" aria-label="All projects"><svg class="icon" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6" /></svg></button>
+          <span data-face></span>
           <div>
-            <h1 id="view-title">JARVIS</h1>
+            <h1 id="view-title">Jarvis</h1>
             <div id="view-sub" class="hidden"></div>
           </div>
         </div>
-        <div style="display:flex; align-items:center; gap:8px;">
-          <button id="search-btn" aria-label="Search history" title="Search history">🔍</button>
+        <div class="header-actions">
+          <button id="search-btn" aria-label="Search history" title="Search history"><svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></svg></button>
           <button id="history-btn" class="hidden">History</button>
           <button id="enable-push-btn" class="hidden" title="Enable notifications">Notify</button>
           <span id="conn-status" class="disconnected">connecting…</span>
@@ -46,6 +59,8 @@
         <div id="search-results"></div>
       </div>
       <div id="home-view">
+        <!-- Plan usage, like Claude Code's /usage (filled by app.js). -->
+        <div id="usage-card" class="hidden"></div>
         <div id="project-list"></div>
         <div id="home-feed"></div>
       </div>
@@ -65,9 +80,9 @@
       </div>
       <div id="mic-note" class="hidden"></div>
       <div id="composer">
-        <button id="mic-btn" aria-label="Speak instead of typing">🎤</button>
+        <button id="mic-btn" aria-label="Speak instead of typing"><svg class="icon" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" /></svg></button>
         <input id="msg-input" type="text" placeholder="Message…" autocomplete="off" />
-        <button id="send-btn">Send</button>
+        <button id="send-btn" aria-label="Send"><svg class="icon" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7" /></svg></button>
       </div>
     </div>
   </div>
