@@ -988,6 +988,109 @@ async function scenarioOpenChoice() {
   }
 }
 
+async function scenarioContainsOpen() {
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const authCentral = fs.realpathSync(projectDir("NOBLEABLE-BE", "auth-central"));
+    const auditLog = fs.realpathSync(projectDir("x", "audit-log"));
+    const tpA = fs.realpathSync(projectDir("NOBLEABLE-BE", "tenant-provisioning"));
+    const tpB = fs.realpathSync(projectDir("SCRIBBER-REPOS", "tenant-provisioning"));
+    registerProjectDirect(srv.dbPath, "auth-central", authCentral);
+    registerProjectDirect(srv.dbPath, "audit-log", auditLog);
+    registerProjectDirect(srv.dbPath, "zeta", fs.realpathSync(projectDir("x", "zeta")));
+    registerProjectDirect(srv.dbPath, "tenant-provisioning (NOBLEABLE-BE)", tpA);
+    registerProjectDirect(srv.dbPath, "tenant-provisioning (SCRIBBER-REPOS)", tpB);
+    const tagsOf = (ack: any) => (ack?.choices ?? []).map((ch: any) => ch.tag).sort().join(",");
+
+    const ack1 = await c.request({ type: "chat", content: "open a run the tests" });
+    const list1 = c.latest((e) => e.tag === "jarvis" && e.choiceId);
+    check("23.1 'a' lists every project whose tag contains an 'a', each with its path, nothing launched",
+      ack1?.reason === "ambiguous" && claudeInvocations().length === 0 &&
+        tagsOf(ack1) === "audit-log,auth-central,tenant-provisioning (NOBLEABLE-BE),tenant-provisioning (SCRIBBER-REPOS),zeta" &&
+        list1?.content.includes("NOBLEABLE-BE/auth-central") && list1?.content.includes("x/zeta"),
+      `${describeAck(ack1)}; list=${JSON.stringify(list1?.content)}`);
+
+    const ack2 = await c.request({ type: "chat", content: "au", openChoice: ack1?.choiceId });
+    check("23.2 typing more while the list is up narrows it to the tags containing that",
+      ack2?.reason === "ambiguous" && tagsOf(ack2) === "audit-log,auth-central" && claudeInvocations().length === 0,
+      describeAck(ack2));
+
+    const ack3 = await c.request({ type: "chat", content: "auth", openChoice: ack2?.choiceId });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv3 = claudeInvocations();
+    check("23.3 narrowing to one opens it, with the original instruction",
+      ack3?.action === "launching" && inv3.length === 1 && inv3[0].startsWith(`cwd=${authCentral} `) && inv3[0].includes("--print run the tests"),
+      `claude invoked: ${JSON.stringify(inv3)}; ${describeAck(ack3)}`);
+
+    // auth-central is now open (still starting), so this one queues to it.
+    const ack4 = await c.request({ type: "chat", content: "open CENTRAL check the logs" });
+    check("23.4 a string only one tag contains opens it directly, ignoring case — anywhere in the name, not just the start",
+      ack4?.ok === true && ack4?.projectKey === authCentral, describeAck(ack4));
+
+    resetClaudeLog();
+    const ack5 = await c.request({ type: "chat", content: "open provisioning run the tests" });
+    check("23.5 a string several tags contain gets the picker",
+      ack5?.reason === "ambiguous" && tagsOf(ack5) === "tenant-provisioning (NOBLEABLE-BE),tenant-provisioning (SCRIBBER-REPOS)" &&
+        claudeInvocations().length === 0,
+      describeAck(ack5));
+
+    const ack6 = await c.request({ type: "chat", content: "open authcentral run the tests" });
+    const said6 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    check("23.6 nothing containing it keeps the full refusal listing every known project — no typo guessing",
+      ack6?.reason === "unknown_project" && claudeInvocations().length === 0 &&
+        said6.startsWith("Don't know that project. Known:") && said6.includes("zeta") && said6.includes("tenant-provisioning (SCRIBBER-REPOS)"),
+      `${describeAck(ack6)}; said=${JSON.stringify(said6)}`);
+
+    const ack7 = await c.request({ type: "chat", content: "open zzz look at audit" });
+    check("23.7 only the first word is matched — a word in the instruction doesn't pick a project",
+      ack7?.reason === "unknown_project", describeAck(ack7));
+
+    // No "open", several sessions running, no reply target: text no session
+    // can take is matched like "open <text>" instead of "Which project?".
+    await sessionStartHook(srv.port, "session-zeta", fs.realpathSync(projectDir("x", "zeta")));
+    await sessionStartHook(srv.port, "session-tpa", tpA);
+    resetClaudeLog();
+    const ack8 = await c.request({ type: "chat", content: "au" });
+    check("23.8 a bare name no session can take offers the registry picker, not the active-sessions list",
+      ack8?.reason === "ambiguous" && tagsOf(ack8) === "audit-log,auth-central" && claudeInvocations().length === 0,
+      describeAck(ack8));
+
+    const ack9 = await c.request({ type: "chat", content: "run the tests" });
+    const said9 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    check("23.9 free text that names no project still gets today's 'Which project?' refusal",
+      ack9?.reason === "unroutable" && said9.startsWith("Which project? Active:") && claudeInvocations().length === 0,
+      `${describeAck(ack9)}; said=${JSON.stringify(said9)}`);
+
+    // A sentence is never matched against project names, even when its
+    // first word is in exactly one tag.
+    registerProjectDirect(srv.dbPath, "jarvis-test", fs.realpathSync(projectDir("x", "jarvis-test")));
+    const ack11 = await c.request({ type: "chat", content: "test the login" });
+    const said11 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    check("23.11 'test the login' isn't read as 'open jarvis-test' — a sentence gets the 'Which project?' refusal, nothing started",
+      ack11?.reason === "unroutable" && said11.startsWith("Which project? Active:") && claudeInvocations().length === 0,
+      `${describeAck(ack11)}; said=${JSON.stringify(said11)}`);
+
+    const ack12 = await c.request({ type: "chat", content: "test" });
+    const said12 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    check("23.12 the same word on its own does name the project ('test' → jarvis-test, which asks what to do)",
+      ack12?.reason === "needs_instruction" && said12.includes('"jarvis-test"') && claudeInvocations().length === 0,
+      `${describeAck(ack12)}; said=${JSON.stringify(said12)}`);
+
+    const ack10 =await c.request({ type: "chat", content: "zeta run the tests", replyToSession: { sessionId: "session-tpa", changedMsAgo: 5000 } });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv10 = claudeInvocations();
+    check("23.10 text a session can take still goes there — naming a running project routes to it as before",
+      inv10.length === 1 && inv10[0].includes("--resume session-zeta"), `claude invoked: ${JSON.stringify(inv10)}; ${describeAck(ack10)}`);
+
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
 function readPermissions(repo: string): { allow: string[]; ask: string[] } | undefined {
   const f = path.join(repo, ".claude", "settings.local.json");
   if (!fs.existsSync(f)) return undefined;
@@ -2095,6 +2198,7 @@ async function main() {
     ["20. Search across history", scenarioSearch],
     ["21. Editing and removing queued messages", scenarioEditQueued],
     ["22. Summarize a change and send it to a colleague (Google Chat stand-in)", scenarioChatSummary],
+    ["23. Project names by contains-match", scenarioContainsOpen],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;

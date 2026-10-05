@@ -463,13 +463,17 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function tagPattern(tag: string): string {
+  return tag.split(/[-_\s]+/).map(escapeRegExp).join("[-_\\s]+");
+}
+
 // Finds the project named in the text. Longest match wins, so
 // "identity (two)" beats "identity". Separators are interchangeable, so
 // "auth central" names "auth-central"; hyphens count as part of a name.
 function findMentionedTag(text: string, tags: string[]): { tag: string; rest: string } | undefined {
   let best: { tag: string; rest: string } | undefined;
   for (const tag of new Set(tags)) {
-    const pattern = tag.split(/[-_\s]+/).map(escapeRegExp).join("[-_\\s]+");
+    const pattern = tagPattern(tag);
     const re = new RegExp(`(?<![\\w-])${pattern}(?![\\w-])`, "i");
     const m = re.exec(text);
     if (m && (!best || tag.length > best.tag.length)) {
@@ -498,7 +502,7 @@ interface TagMatch {
 function findAllMentionedTags(text: string, tags: string[]): TagMatch[] {
   const matches: TagMatch[] = [];
   for (const tag of new Set(tags)) {
-    const pattern = tag.split(/[-_\s]+/).map(escapeRegExp).join("[-_\\s]+");
+    const pattern = tagPattern(tag);
     const re = new RegExp(`(?<![\\w-])${pattern}(?![\\w-])`, "gi");
     for (let m = re.exec(text); m; m = re.exec(text)) {
       matches.push({ tag, start: m.index, end: m.index + m[0].length });
@@ -509,6 +513,17 @@ function findAllMentionedTags(text: string, tags: string[]): TagMatch[] {
   );
   const seen = new Set<string>();
   return kept.filter((m) => !seen.has(m.tag) && seen.add(m.tag));
+}
+
+// Every name containing the text's first word, ignoring case — "a" matches
+// every name with an "a" in it. Only the first word is used: that's where
+// "open <project>" puts the name, so the instruction can't pick a project.
+// Not used for routing free text, where any word would hit some project.
+function findTagsContaining(text: string, names: string[]): TagMatch[] {
+  const m = /\S+/.exec(text);
+  if (!m) return [];
+  const typed = m[0].toLowerCase();
+  return [...new Set(names)].filter((name) => name.toLowerCase().includes(typed)).map((tag) => ({ tag, start: m.index, end: m.index + m[0].length }));
 }
 
 function prettyPath(p: string): string {
@@ -813,6 +828,7 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
   }
 
   if (active.length === 0) {
+    if (implicitOpen(text, active, ack, refuse)) return;
     echoUser(text);
     refuse("unroutable", "No projects are currently active. Start a claude session in a watched project first.");
     return;
@@ -830,6 +846,7 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
         ? active[0]
         : undefined;
   if (!session) {
+    if (implicitOpen(text, active, ack, refuse)) return;
     echoUser(text);
     const projects = [...new Set(active.map((s) => s.project_tag))].join(", ");
     refuse("unroutable", `Which project? Active: ${projects}.`);
@@ -885,12 +902,20 @@ function resolveOpenTarget(afterVerb: string, known: string[]): OpenTarget {
     byFolder.set(folder, [...(byFolder.get(folder) ?? []), p.tag]);
   }
   const folderMatches = findAllMentionedTags(afterVerb, [...byFolder.keys()]);
-  if (folderMatches.length === 0) return { kind: "none" };
-  const tagsForMatches = [...new Set(folderMatches.flatMap((m) => byFolder.get(m.tag)!))];
-  if (folderMatches.length === 1 && tagsForMatches.length === 1) {
-    return { kind: "one", tag: tagsForMatches[0], rest: restWithout(folderMatches) };
+  if (folderMatches.length > 0) {
+    const tagsForMatches = [...new Set(folderMatches.flatMap((m) => byFolder.get(m.tag)!))];
+    if (folderMatches.length === 1 && tagsForMatches.length === 1) {
+      return { kind: "one", tag: tagsForMatches[0], rest: restWithout(folderMatches) };
+    }
+    return { kind: "ambiguous", candidates: tagsForMatches.map((tag) => ({ tag, cwd: cwdOf(tag) })), rest: restWithout(folderMatches) };
   }
-  return { kind: "ambiguous", candidates: tagsForMatches.map((tag) => ({ tag, cwd: cwdOf(tag) })), rest: restWithout(folderMatches) };
+
+  // Nothing named exactly — list every project whose tag contains what was
+  // typed. One opens directly; several go to the same picker as above.
+  const containing = findTagsContaining(afterVerb, known);
+  if (containing.length === 0) return { kind: "none" };
+  if (containing.length === 1) return { kind: "one", tag: containing[0].tag, rest: restWithout(containing) };
+  return { kind: "ambiguous", candidates: containing.map((m) => ({ tag: m.tag, cwd: cwdOf(m.tag) })), rest: restWithout(containing.slice(0, 1)) };
 }
 
 // An ambiguous "open" leaves an answerable list behind. The reply that
@@ -931,6 +956,24 @@ function handleOpen(text: string, active: SessionRecord[], ack: Ack, refuse: Ref
   openProject(target.tag, cleanInstruction(target.rest), text, active, ack, refuse);
 }
 
+// A lone word that no session can take is read as "open <word>" — so "auth"
+// or "a" alone opens or offers the picker. Only a single word: a sentence
+// is never matched against project names ("test the login" must not start
+// jarvis-test), and gets the caller's refusal like any text that names
+// nothing. This never takes a message a session would have.
+function implicitOpen(text: string, active: SessionRecord[], ack: Ack, refuse: Refuse): boolean {
+  if (!/^\S+$/.test(text.trim())) return false;
+  const target = resolveOpenTarget(text.trim(), knownProjectTags());
+  if (target.kind === "none") return false;
+  if (target.kind === "ambiguous") {
+    echoUser(text);
+    offerOpenChoice(target.candidates, cleanInstruction(target.rest), refuse, "Which project?");
+    return true;
+  }
+  openProject(target.tag, cleanInstruction(target.rest), text, active, ack, refuse);
+  return true;
+}
+
 // A reply answering an open-choice list: a number ("2", "2 check the logs"),
 // a tapped option, or the option's full name. Anything typed after the pick
 // replaces the original instruction. A reply that doesn't pick exactly one
@@ -945,19 +988,29 @@ function handleOpenChoice(choiceId: string, text: string, active: SessionRecord[
   }
 
   let picked: string | undefined;
+  let narrowed: string[] | undefined;
   let rest = "";
   const numbered = /^#?(\d+)(?:[.):]|\s|$)\s*([\s\S]*)$/.exec(text.trim());
   if (numbered) {
     picked = choice.candidates[Number(numbered[1]) - 1];
     rest = numbered[2];
   } else {
-    const matches = findAllMentionedTags(text, choice.candidates);
-    if (matches.length === 1) {
-      picked = matches[0].tag;
-      rest = trimRest(text.slice(0, matches[0].start) + text.slice(matches[0].end));
-    }
+    let matches = findAllMentionedTags(text, choice.candidates);
+    if (matches.length === 0) matches = findTagsContaining(text, choice.candidates);
+    if (matches.length > 0) rest = trimRest(text.slice(0, matches[0].start) + text.slice(matches[0].end));
+    if (matches.length === 1) picked = matches[0].tag;
+    else if (matches.length > 1 && matches.length < choice.candidates.length) narrowed = matches.map((m) => m.tag);
   }
 
+  // Typing more of a name ("a", then "au", then "aut") narrows the list
+  // each time; anything typed after it replaces the instruction, as a pick
+  // would.
+  if (narrowed) {
+    echoUser(text);
+    const instruction = cleanInstruction(rest) || choice.instruction;
+    offerOpenChoice(narrowed.map((tag) => ({ tag, cwd: findLaunchableCwd(tag) })), instruction, refuse, "Narrowed down.");
+    return;
+  }
   const candidates = choice.candidates.map((tag) => ({ tag, cwd: findLaunchableCwd(tag) }));
   if (!picked) {
     echoUser(text);
