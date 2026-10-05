@@ -114,8 +114,20 @@ interface Busy {
   lastActivity: number;
   nudged: boolean;
   draftId?: string; // this turn is Jarvis asking for a summary to send
+  startedAt: number;
+  tools: Map<string, RunningTool>; // tool calls in progress, by the agent's tool-use ID
 }
 const busy = new Map<string, Busy>();
+
+// A tool call reported by the agent's activity hooks (PreToolUse) and not yet
+// reported finished (PostToolUse / PostToolUseFailure). Live only: never
+// stored, never pushed.
+interface RunningTool {
+  title: string;
+  agentId?: string; // set when a subagent made the call
+  agentType?: string; // the subagent's name, e.g. "Explore"
+  startedAt: number;
+}
 
 // A message waiting for a busy session. Each has an ID so you can see it and
 // take it back before it sends; the queue here is what actually gets sent.
@@ -145,6 +157,58 @@ function broadcastQueue(): void {
 }
 registerConnectSnapshot(queueSnapshot);
 
+// ---- Turns in progress, for the "working" indicator ----
+// Every session with a turn running: when it started, when anything was last
+// heard from it, and — for agents that report activity — which tool calls are
+// running right now. `now` lets the phone correct for its clock differing
+// from this machine's. Sessions that have reported activity at least once
+// are flagged, so the phone only says "Thinking…" (no tool running) when
+// it would actually hear about a tool.
+const reportsActivity = new Set<string>();
+const TURNS_THROTTLE_MS = 400;
+let turnsTimer: ReturnType<typeof setTimeout> | null = null;
+
+function turnsSnapshot() {
+  return {
+    type: "turns",
+    now: Date.now(),
+    quietMs: config.busyNudgeMs,
+    sessions: [...busy.entries()].map(([sessionId, e]) => ({
+      sessionId,
+      projectTag: e.tag,
+      projectKey: getSession(sessionId)?.cwd ?? undefined,
+      kind: e.kind,
+      startedAt: e.startedAt,
+      lastActivity: e.lastActivity,
+      reportsActivity: reportsActivity.has(sessionId),
+      tools: [...e.tools.values()]
+        .sort((a, b) => a.startedAt - b.startedAt)
+        .map(({ title, agentId, agentType, startedAt }) => ({ title, agentId, agentType, startedAt })),
+    })),
+  };
+}
+registerConnectSnapshot(turnsSnapshot);
+
+// A turn starting or ending goes out at once; tool activity, which can come
+// in bursts of dozens, at most every TURNS_THROTTLE_MS.
+function broadcastTurns(now = false): void {
+  if (now) {
+    if (turnsTimer) clearTimeout(turnsTimer);
+    turnsTimer = null;
+    broadcast(turnsSnapshot());
+    return;
+  }
+  turnsTimer ??= setTimeout(() => {
+    turnsTimer = null;
+    broadcast(turnsSnapshot());
+  }, TURNS_THROTTLE_MS);
+}
+
+function endTurn(sessionId: string): void {
+  busy.delete(sessionId);
+  broadcastTurns(true);
+}
+
 function markBusy(sessionId: string, tag: string, kind: Busy["kind"]): string {
   const token = randomUUID();
   const existing = busy.get(sessionId);
@@ -155,7 +219,10 @@ function markBusy(sessionId: string, tag: string, kind: Busy["kind"]): string {
     token,
     lastActivity: Date.now(),
     nudged: false,
+    startedAt: Date.now(),
+    tools: new Map(),
   });
+  broadcastTurns(true);
   return token;
 }
 
@@ -177,7 +244,7 @@ function spawnResume(session: SessionRecord, text: string, draftId?: string): Ch
     setTimeout(() => {
       const entry = busy.get(session.id);
       if (!entry || entry.token !== token) return;
-      busy.delete(session.id);
+      endTurn(session.id);
       broadcastQueue();
       if (entry.draftId) draftReplyArrived(entry.draftId, undefined);
       if (entry.queued.length) {
@@ -212,7 +279,7 @@ function spawnFresh(tag: string, cwd: string, agent: string, instruction: string
     setTimeout(() => {
       const entry = busy.get(sessionId);
       if (!entry || entry.token !== token) return;
-      busy.delete(sessionId);
+      endTurn(sessionId);
       broadcastQueue();
       setSessionStatus(sessionId, "error");
       const lost = entry.queued.length
@@ -262,9 +329,60 @@ export function onTurnActivity(sessionId: string, tag: string): void {
   if (entry) {
     entry.lastActivity = Date.now();
     entry.nudged = false;
+    broadcastTurns();
     return;
   }
   markBusy(sessionId, tag, "turn");
+}
+
+// A tool call starting (the agent's PreToolUse). It proves a turn is running,
+// like a permission request — but only the main agent's: a subagent can keep
+// working after the turn's Stop (one run in the background), and that must
+// not make the session look busy, or messages would queue behind it.
+//
+// An agent runs its tool calls in batches — every call in a batch starts
+// together, and the next batch only starts once the last one has finished.
+// So a call from an agent whose newest running call started more than
+// BATCH_GAP_MS ago means that agent's earlier calls are over, even if their
+// "finished" never arrived (a denied call may not report one).
+const BATCH_GAP_MS = 1500;
+export function onToolStart(
+  sessionId: string,
+  tag: string,
+  tool: { toolUseId?: string; title: string; agentId?: string; agentType?: string },
+): void {
+  reportsActivity.add(sessionId);
+  if (!busy.has(sessionId)) {
+    if (tool.agentId) return;
+    markBusy(sessionId, tag, "turn");
+  }
+  const entry = busy.get(sessionId)!;
+  const now = Date.now();
+  entry.lastActivity = now;
+  entry.nudged = false;
+  const mine = [...entry.tools.entries()].filter(([, t]) => t.agentId === tool.agentId);
+  if (mine.length && now - Math.max(...mine.map(([, t]) => t.startedAt)) > BATCH_GAP_MS) {
+    for (const [id] of mine) entry.tools.delete(id);
+  }
+  entry.tools.set(tool.toolUseId ?? randomUUID(), {
+    title: tool.title,
+    agentId: tool.agentId,
+    agentType: tool.agentType,
+    startedAt: now,
+  });
+  broadcastTurns();
+}
+
+// A tool call finished, or failed (PostToolUse / PostToolUseFailure). Never
+// starts a turn.
+export function onToolEnd(sessionId: string, toolUseId?: string): void {
+  reportsActivity.add(sessionId);
+  const entry = busy.get(sessionId);
+  if (!entry) return;
+  entry.lastActivity = Date.now();
+  entry.nudged = false;
+  if (toolUseId) entry.tools.delete(toolUseId);
+  broadcastTurns();
 }
 
 // A turn's Stop hook: the session is free. A drafting turn's reply becomes
@@ -274,7 +392,7 @@ export function onTurnActivity(sessionId: string, tag: string): void {
 export function onTurnEnded(sessionId: string, lastText?: string): void {
   const entry = busy.get(sessionId);
   if (!entry) return;
-  busy.delete(sessionId);
+  endTurn(sessionId);
   if (entry.draftId) draftReplyArrived(entry.draftId, lastText);
   if (entry.queued.length) flush(sessionId, entry);
   else startWaitingDraft(sessionId);
@@ -454,7 +572,7 @@ function handleSendNow(text: string, replyToSession: string | undefined, ack: Ac
     return;
   }
   const [sessionId, entry] = candidates[0];
-  busy.delete(sessionId);
+  endTurn(sessionId);
   flush(sessionId, entry);
   ack(true, { action: "sent_now", sessionId });
 }
@@ -463,13 +581,17 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function tagPattern(tag: string): string {
+  return tag.split(/[-_\s]+/).map(escapeRegExp).join("[-_\\s]+");
+}
+
 // Finds the project named in the text. Longest match wins, so
 // "identity (two)" beats "identity". Separators are interchangeable, so
 // "auth central" names "auth-central"; hyphens count as part of a name.
 function findMentionedTag(text: string, tags: string[]): { tag: string; rest: string } | undefined {
   let best: { tag: string; rest: string } | undefined;
   for (const tag of new Set(tags)) {
-    const pattern = tag.split(/[-_\s]+/).map(escapeRegExp).join("[-_\\s]+");
+    const pattern = tagPattern(tag);
     const re = new RegExp(`(?<![\\w-])${pattern}(?![\\w-])`, "i");
     const m = re.exec(text);
     if (m && (!best || tag.length > best.tag.length)) {
@@ -498,7 +620,7 @@ interface TagMatch {
 function findAllMentionedTags(text: string, tags: string[]): TagMatch[] {
   const matches: TagMatch[] = [];
   for (const tag of new Set(tags)) {
-    const pattern = tag.split(/[-_\s]+/).map(escapeRegExp).join("[-_\\s]+");
+    const pattern = tagPattern(tag);
     const re = new RegExp(`(?<![\\w-])${pattern}(?![\\w-])`, "gi");
     for (let m = re.exec(text); m; m = re.exec(text)) {
       matches.push({ tag, start: m.index, end: m.index + m[0].length });
@@ -509,6 +631,17 @@ function findAllMentionedTags(text: string, tags: string[]): TagMatch[] {
   );
   const seen = new Set<string>();
   return kept.filter((m) => !seen.has(m.tag) && seen.add(m.tag));
+}
+
+// Every name containing the text's first word, ignoring case — "a" matches
+// every name with an "a" in it. Only the first word is used: that's where
+// "open <project>" puts the name, so the instruction can't pick a project.
+// Not used for routing free text, where any word would hit some project.
+function findTagsContaining(text: string, names: string[]): TagMatch[] {
+  const m = /\S+/.exec(text);
+  if (!m) return [];
+  const typed = m[0].toLowerCase();
+  return [...new Set(names)].filter((name) => name.toLowerCase().includes(typed)).map((tag) => ({ tag, start: m.index, end: m.index + m[0].length }));
 }
 
 function prettyPath(p: string): string {
@@ -813,6 +946,7 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
   }
 
   if (active.length === 0) {
+    if (implicitOpen(text, active, ack, refuse)) return;
     echoUser(text);
     refuse("unroutable", "No projects are currently active. Start a claude session in a watched project first.");
     return;
@@ -830,6 +964,7 @@ function handleChat(msg: Extract<InboundMessage, { type: "chat" }>, ack: Ack, re
         ? active[0]
         : undefined;
   if (!session) {
+    if (implicitOpen(text, active, ack, refuse)) return;
     echoUser(text);
     const projects = [...new Set(active.map((s) => s.project_tag))].join(", ");
     refuse("unroutable", `Which project? Active: ${projects}.`);
@@ -885,12 +1020,20 @@ function resolveOpenTarget(afterVerb: string, known: string[]): OpenTarget {
     byFolder.set(folder, [...(byFolder.get(folder) ?? []), p.tag]);
   }
   const folderMatches = findAllMentionedTags(afterVerb, [...byFolder.keys()]);
-  if (folderMatches.length === 0) return { kind: "none" };
-  const tagsForMatches = [...new Set(folderMatches.flatMap((m) => byFolder.get(m.tag)!))];
-  if (folderMatches.length === 1 && tagsForMatches.length === 1) {
-    return { kind: "one", tag: tagsForMatches[0], rest: restWithout(folderMatches) };
+  if (folderMatches.length > 0) {
+    const tagsForMatches = [...new Set(folderMatches.flatMap((m) => byFolder.get(m.tag)!))];
+    if (folderMatches.length === 1 && tagsForMatches.length === 1) {
+      return { kind: "one", tag: tagsForMatches[0], rest: restWithout(folderMatches) };
+    }
+    return { kind: "ambiguous", candidates: tagsForMatches.map((tag) => ({ tag, cwd: cwdOf(tag) })), rest: restWithout(folderMatches) };
   }
-  return { kind: "ambiguous", candidates: tagsForMatches.map((tag) => ({ tag, cwd: cwdOf(tag) })), rest: restWithout(folderMatches) };
+
+  // Nothing named exactly — list every project whose tag contains what was
+  // typed. One opens directly; several go to the same picker as above.
+  const containing = findTagsContaining(afterVerb, known);
+  if (containing.length === 0) return { kind: "none" };
+  if (containing.length === 1) return { kind: "one", tag: containing[0].tag, rest: restWithout(containing) };
+  return { kind: "ambiguous", candidates: containing.map((m) => ({ tag: m.tag, cwd: cwdOf(m.tag) })), rest: restWithout(containing.slice(0, 1)) };
 }
 
 // An ambiguous "open" leaves an answerable list behind. The reply that
@@ -931,6 +1074,24 @@ function handleOpen(text: string, active: SessionRecord[], ack: Ack, refuse: Ref
   openProject(target.tag, cleanInstruction(target.rest), text, active, ack, refuse);
 }
 
+// A lone word that no session can take is read as "open <word>" — so "auth"
+// or "a" alone opens or offers the picker. Only a single word: a sentence
+// is never matched against project names ("test the login" must not start
+// jarvis-test), and gets the caller's refusal like any text that names
+// nothing. This never takes a message a session would have.
+function implicitOpen(text: string, active: SessionRecord[], ack: Ack, refuse: Refuse): boolean {
+  if (!/^\S+$/.test(text.trim())) return false;
+  const target = resolveOpenTarget(text.trim(), knownProjectTags());
+  if (target.kind === "none") return false;
+  if (target.kind === "ambiguous") {
+    echoUser(text);
+    offerOpenChoice(target.candidates, cleanInstruction(target.rest), refuse, "Which project?");
+    return true;
+  }
+  openProject(target.tag, cleanInstruction(target.rest), text, active, ack, refuse);
+  return true;
+}
+
 // A reply answering an open-choice list: a number ("2", "2 check the logs"),
 // a tapped option, or the option's full name. Anything typed after the pick
 // replaces the original instruction. A reply that doesn't pick exactly one
@@ -945,19 +1106,29 @@ function handleOpenChoice(choiceId: string, text: string, active: SessionRecord[
   }
 
   let picked: string | undefined;
+  let narrowed: string[] | undefined;
   let rest = "";
   const numbered = /^#?(\d+)(?:[.):]|\s|$)\s*([\s\S]*)$/.exec(text.trim());
   if (numbered) {
     picked = choice.candidates[Number(numbered[1]) - 1];
     rest = numbered[2];
   } else {
-    const matches = findAllMentionedTags(text, choice.candidates);
-    if (matches.length === 1) {
-      picked = matches[0].tag;
-      rest = trimRest(text.slice(0, matches[0].start) + text.slice(matches[0].end));
-    }
+    let matches = findAllMentionedTags(text, choice.candidates);
+    if (matches.length === 0) matches = findTagsContaining(text, choice.candidates);
+    if (matches.length > 0) rest = trimRest(text.slice(0, matches[0].start) + text.slice(matches[0].end));
+    if (matches.length === 1) picked = matches[0].tag;
+    else if (matches.length > 1 && matches.length < choice.candidates.length) narrowed = matches.map((m) => m.tag);
   }
 
+  // Typing more of a name ("a", then "au", then "aut") narrows the list
+  // each time; anything typed after it replaces the instruction, as a pick
+  // would.
+  if (narrowed) {
+    echoUser(text);
+    const instruction = cleanInstruction(rest) || choice.instruction;
+    offerOpenChoice(narrowed.map((tag) => ({ tag, cwd: findLaunchableCwd(tag) })), instruction, refuse, "Narrowed down.");
+    return;
+  }
   const candidates = choice.candidates.map((tag) => ({ tag, cwd: findLaunchableCwd(tag) }));
   if (!picked) {
     echoUser(text);

@@ -34,6 +34,8 @@ const searchResults = document.getElementById("search-results");
 const replyTargetEl = document.getElementById("reply-target");
 const replyTargetLabel = document.getElementById("reply-target-label");
 const replyTargetClear = document.getElementById("reply-target-clear");
+const activityEl = document.getElementById("activity");
+const workingLine = document.getElementById("working-line");
 
 let ws = null;
 let reconnectDelay = 1000;
@@ -521,6 +523,122 @@ function renderQueue(sessions) {
   }
 }
 
+// ---- Turns in progress: the working indicator ----
+// Straight from the server: which sessions have a turn running, since when,
+// when anything was last heard from them, and — where the agent reports
+// activity — the tool calls running right now. Nothing is made up: "Thinking…"
+// (no tool running) only shows for a session that reports its tool calls, and
+// a long silence is said out loud, because a turn interrupted in the terminal
+// never reports that it ended.
+let turns = new Map(); // sessionId -> turn
+let serverOffset = 0; // the server's clock minus this device's
+let quietMs = 10 * 60_000;
+let turnsTicker = null;
+const MAX_TOOL_LINES = 4;
+const serverNow = () => Date.now() + serverOffset;
+
+function elapsed(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+function waitingOnYou(sessionId) {
+  return [...permissions.values()].some((p) => p.status === "pending" && p.sessionId === sessionId);
+}
+
+function workingKeys() {
+  return new Set([...turns.values()].map((t) => t.projectKey).filter(Boolean));
+}
+
+function renderActivity() {
+  const here = currentProject && viewingLive ? [...turns.values()].filter((t) => t.projectKey === currentProject) : [];
+  activityEl.replaceChildren();
+  activityEl.classList.toggle("hidden", !here.length);
+  const now = serverNow();
+  for (const t of here) {
+    const waiting = waitingOnYou(t.sessionId);
+    const quiet = !waiting && now - t.lastActivity > quietMs;
+    const block = document.createElement("div");
+    block.className = `activity-turn${waiting ? " waiting" : quiet ? " quiet" : ""}`;
+    const head = document.createElement("div");
+    head.className = "activity-head";
+    const dot = document.createElement("span");
+    dot.className = "activity-dot";
+    const label = document.createElement("span");
+    const state = waiting ? "Waiting on you" : t.kind === "launch" ? "Starting up" : "Working";
+    const which = here.length > 1 ? ` (session ${t.sessionId.slice(0, 8)})` : "";
+    label.textContent = `${state}${which} · ${elapsed(now - t.startedAt)}`;
+    head.append(dot, label);
+    block.appendChild(head);
+    if (!waiting) {
+      for (const tool of t.tools.slice(-MAX_TOOL_LINES)) {
+        const line = document.createElement("div");
+        line.className = "activity-line";
+        if (tool.agentType) {
+          const who = document.createElement("span");
+          who.className = "activity-agent";
+          who.textContent = `${tool.agentType}: `;
+          line.appendChild(who);
+        }
+        const running = now - tool.startedAt;
+        line.append(`${tool.title}…${running >= 10_000 ? ` · ${elapsed(running)}` : ""}`);
+        block.appendChild(line);
+      }
+      if (t.tools.length > MAX_TOOL_LINES) {
+        const more = document.createElement("div");
+        more.className = "activity-line dim";
+        more.textContent = `+${t.tools.length - MAX_TOOL_LINES} more running`;
+        block.appendChild(more);
+      }
+      if (!t.tools.length && t.reportsActivity) {
+        const line = document.createElement("div");
+        line.className = "activity-line dim";
+        line.textContent = "Thinking…";
+        block.appendChild(line);
+      }
+    }
+    if (quiet) {
+      const warn = document.createElement("div");
+      warn.className = "activity-note";
+      warn.textContent = `Nothing heard for ${elapsed(now - t.lastActivity)} — it may have been interrupted in the terminal.`;
+      block.appendChild(warn);
+    }
+    activityEl.appendChild(block);
+  }
+}
+
+// Other projects with a turn running: names only, kept apart from the strip
+// above it, which is only for things that need you.
+function renderWorkingLine() {
+  const elsewhere = [...workingKeys()].filter((key) => key !== currentProject || !viewingLive);
+  workingLine.replaceChildren();
+  workingLine.classList.toggle("hidden", !elsewhere.length);
+  if (!elsewhere.length) return;
+  workingLine.append("Working:");
+  for (const key of elsewhere) {
+    const chip = document.createElement("button");
+    chip.className = "working-chip";
+    chip.textContent = projects.get(key)?.tag ?? [...turns.values()].find((t) => t.projectKey === key)?.projectTag ?? prettyPath(key);
+    chip.addEventListener("click", () => openProject(key));
+    workingLine.appendChild(chip);
+  }
+}
+
+function setTurns(msg) {
+  serverOffset = msg.now - Date.now();
+  if (msg.quietMs) quietMs = msg.quietMs;
+  turns = new Map(msg.sessions.map((s) => [s.sessionId, s]));
+  if (turns.size && !turnsTicker) turnsTicker = setInterval(renderActivity, 1000);
+  if (!turns.size && turnsTicker) {
+    clearInterval(turnsTicker);
+    turnsTicker = null;
+  }
+  renderWaiting();
+}
+
 // ---- Per-project history ----
 // A project is its full path (projectKey), never its display name. Home is
 // the list of projects; opening one shows its latest block of work, live;
@@ -600,6 +718,7 @@ function projectRow(p, pending) {
   side.appendChild(when);
   const badges = document.createElement("div");
   if (pending) badges.append(badge(`${pending} waiting`, "waiting"));
+  else if (workingKeys().has(p.key)) badges.append(badge("working", "working"));
   if (unread.get(p.key)) badges.append(badge(`${unread.get(p.key)} new`, "new"));
   side.appendChild(badges);
   row.append(main, side);
@@ -656,6 +775,8 @@ function renderWaiting() {
     btn.addEventListener("click", () => openProject(key));
     waitingStrip.appendChild(btn);
   }
+  renderWorkingLine();
+  renderActivity();
   if (!currentProject) renderHome();
 }
 
@@ -1037,6 +1158,10 @@ function actions(list) {
 function handleServerMessage(msg) {
   if (msg.type === "queue") {
     renderQueue(msg.sessions);
+    return;
+  }
+  if (msg.type === "turns") {
+    setTurns(msg);
     return;
   }
   if (msg.type === "drafts" || msg.type === "draft") {

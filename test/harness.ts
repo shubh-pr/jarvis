@@ -988,6 +988,109 @@ async function scenarioOpenChoice() {
   }
 }
 
+async function scenarioContainsOpen() {
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const authCentral = fs.realpathSync(projectDir("NOBLEABLE-BE", "auth-central"));
+    const auditLog = fs.realpathSync(projectDir("x", "audit-log"));
+    const tpA = fs.realpathSync(projectDir("NOBLEABLE-BE", "tenant-provisioning"));
+    const tpB = fs.realpathSync(projectDir("SCRIBBER-REPOS", "tenant-provisioning"));
+    registerProjectDirect(srv.dbPath, "auth-central", authCentral);
+    registerProjectDirect(srv.dbPath, "audit-log", auditLog);
+    registerProjectDirect(srv.dbPath, "zeta", fs.realpathSync(projectDir("x", "zeta")));
+    registerProjectDirect(srv.dbPath, "tenant-provisioning (NOBLEABLE-BE)", tpA);
+    registerProjectDirect(srv.dbPath, "tenant-provisioning (SCRIBBER-REPOS)", tpB);
+    const tagsOf = (ack: any) => (ack?.choices ?? []).map((ch: any) => ch.tag).sort().join(",");
+
+    const ack1 = await c.request({ type: "chat", content: "open a run the tests" });
+    const list1 = c.latest((e) => e.tag === "jarvis" && e.choiceId);
+    check("23.1 'a' lists every project whose tag contains an 'a', each with its path, nothing launched",
+      ack1?.reason === "ambiguous" && claudeInvocations().length === 0 &&
+        tagsOf(ack1) === "audit-log,auth-central,tenant-provisioning (NOBLEABLE-BE),tenant-provisioning (SCRIBBER-REPOS),zeta" &&
+        list1?.content.includes("NOBLEABLE-BE/auth-central") && list1?.content.includes("x/zeta"),
+      `${describeAck(ack1)}; list=${JSON.stringify(list1?.content)}`);
+
+    const ack2 = await c.request({ type: "chat", content: "au", openChoice: ack1?.choiceId });
+    check("23.2 typing more while the list is up narrows it to the tags containing that",
+      ack2?.reason === "ambiguous" && tagsOf(ack2) === "audit-log,auth-central" && claudeInvocations().length === 0,
+      describeAck(ack2));
+
+    const ack3 = await c.request({ type: "chat", content: "auth", openChoice: ack2?.choiceId });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv3 = claudeInvocations();
+    check("23.3 narrowing to one opens it, with the original instruction",
+      ack3?.action === "launching" && inv3.length === 1 && inv3[0].startsWith(`cwd=${authCentral} `) && inv3[0].includes("--print run the tests"),
+      `claude invoked: ${JSON.stringify(inv3)}; ${describeAck(ack3)}`);
+
+    // auth-central is now open (still starting), so this one queues to it.
+    const ack4 = await c.request({ type: "chat", content: "open CENTRAL check the logs" });
+    check("23.4 a string only one tag contains opens it directly, ignoring case — anywhere in the name, not just the start",
+      ack4?.ok === true && ack4?.projectKey === authCentral, describeAck(ack4));
+
+    resetClaudeLog();
+    const ack5 = await c.request({ type: "chat", content: "open provisioning run the tests" });
+    check("23.5 a string several tags contain gets the picker",
+      ack5?.reason === "ambiguous" && tagsOf(ack5) === "tenant-provisioning (NOBLEABLE-BE),tenant-provisioning (SCRIBBER-REPOS)" &&
+        claudeInvocations().length === 0,
+      describeAck(ack5));
+
+    const ack6 = await c.request({ type: "chat", content: "open authcentral run the tests" });
+    const said6 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    check("23.6 nothing containing it keeps the full refusal listing every known project — no typo guessing",
+      ack6?.reason === "unknown_project" && claudeInvocations().length === 0 &&
+        said6.startsWith("Don't know that project. Known:") && said6.includes("zeta") && said6.includes("tenant-provisioning (SCRIBBER-REPOS)"),
+      `${describeAck(ack6)}; said=${JSON.stringify(said6)}`);
+
+    const ack7 = await c.request({ type: "chat", content: "open zzz look at audit" });
+    check("23.7 only the first word is matched — a word in the instruction doesn't pick a project",
+      ack7?.reason === "unknown_project", describeAck(ack7));
+
+    // No "open", several sessions running, no reply target: text no session
+    // can take is matched like "open <text>" instead of "Which project?".
+    await sessionStartHook(srv.port, "session-zeta", fs.realpathSync(projectDir("x", "zeta")));
+    await sessionStartHook(srv.port, "session-tpa", tpA);
+    resetClaudeLog();
+    const ack8 = await c.request({ type: "chat", content: "au" });
+    check("23.8 a bare name no session can take offers the registry picker, not the active-sessions list",
+      ack8?.reason === "ambiguous" && tagsOf(ack8) === "audit-log,auth-central" && claudeInvocations().length === 0,
+      describeAck(ack8));
+
+    const ack9 = await c.request({ type: "chat", content: "run the tests" });
+    const said9 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    check("23.9 free text that names no project still gets today's 'Which project?' refusal",
+      ack9?.reason === "unroutable" && said9.startsWith("Which project? Active:") && claudeInvocations().length === 0,
+      `${describeAck(ack9)}; said=${JSON.stringify(said9)}`);
+
+    // A sentence is never matched against project names, even when its
+    // first word is in exactly one tag.
+    registerProjectDirect(srv.dbPath, "jarvis-test", fs.realpathSync(projectDir("x", "jarvis-test")));
+    const ack11 = await c.request({ type: "chat", content: "test the login" });
+    const said11 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    check("23.11 'test the login' isn't read as 'open jarvis-test' — a sentence gets the 'Which project?' refusal, nothing started",
+      ack11?.reason === "unroutable" && said11.startsWith("Which project? Active:") && claudeInvocations().length === 0,
+      `${describeAck(ack11)}; said=${JSON.stringify(said11)}`);
+
+    const ack12 = await c.request({ type: "chat", content: "test" });
+    const said12 = c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+    check("23.12 the same word on its own does name the project ('test' → jarvis-test, which asks what to do)",
+      ack12?.reason === "needs_instruction" && said12.includes('"jarvis-test"') && claudeInvocations().length === 0,
+      `${describeAck(ack12)}; said=${JSON.stringify(said12)}`);
+
+    const ack10 =await c.request({ type: "chat", content: "zeta run the tests", replyToSession: { sessionId: "session-tpa", changedMsAgo: 5000 } });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv10 = claudeInvocations();
+    check("23.10 text a session can take still goes there — naming a running project routes to it as before",
+      inv10.length === 1 && inv10[0].includes("--resume session-zeta"), `claude invoked: ${JSON.stringify(inv10)}; ${describeAck(ack10)}`);
+
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
 function readPermissions(repo: string): { allow: string[]; ask: string[] } | undefined {
   const f = path.join(repo, ".claude", "settings.local.json");
   if (!fs.existsSync(f)) return undefined;
@@ -2070,6 +2173,195 @@ async function scenarioChatSummary() {
 
 // ---------- main ----------
 
+// ---------- the working indicator and observe-only activity hooks ----------
+
+// Posts a raw body to an activity hook; returns exactly what came back.
+async function activityHook(port: number, hook: "pre-tool-use" | "post-tool-use", body: string) {
+  const started = Date.now();
+  const res = await fetch(`http://localhost:${port}/api/hooks/${hook}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${HOOKS_SECRET}` },
+    body,
+  });
+  return { status: res.status, text: await res.text(), ms: Date.now() - started };
+}
+
+function preTool(port: number, sessionId: string, cwd: string, toolUseId: string, toolName: string, toolInput: unknown, extra: Record<string, unknown> = {}) {
+  return activityHook(port, "pre-tool-use", JSON.stringify({
+    session_id: sessionId, cwd, hook_event_name: "PreToolUse", tool_name: toolName, tool_input: toolInput, tool_use_id: toolUseId, ...extra,
+  }));
+}
+
+function postTool(port: number, sessionId: string, cwd: string, toolUseId: string, extra: Record<string, unknown> = {}) {
+  return activityHook(port, "post-tool-use", JSON.stringify({
+    session_id: sessionId, cwd, hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: toolUseId, tool_response: { stdout: "ok" }, ...extra,
+  }));
+}
+
+const turnOf = (c: Client, sessionId: string) => c.latest((e) => e.type === "turns")?.sessions.find((s: any) => s.sessionId === sessionId);
+
+async function scenarioActivity() {
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const cwd = projectDir("activity-svc");
+    const settle = () => sleep(600); // past the 400ms activity throttle
+
+    // --- Turn state: start, connect snapshot, end ---
+    await stopHook(srv.port, "s-act", cwd);
+    await userPromptSubmitHook(srv.port, "s-act", cwd, "run the tests and fix failures");
+    await settle();
+    const t1 = turnOf(c, "s-act");
+    check("24.1 a turn starting is broadcast at once — when it started, its project, and no activity claimed yet",
+      !!t1 && t1.projectKey === cwd && typeof t1.startedAt === "number" && t1.kind === "turn" && t1.reportsActivity === false && t1.tools.length === 0,
+      JSON.stringify(t1));
+    const late = await Client.open(srv.port, token);
+    const snap = await late.waitFor((e) => e.type === "turns");
+    check("24.2 a phone connecting mid-turn gets the turn in its first snapshot, with the server's clock for elapsed time",
+      !!snap?.sessions.find((x: any) => x.sessionId === "s-act") && typeof snap.now === "number" && typeof snap.quietMs === "number",
+      JSON.stringify(snap));
+    late.close();
+
+    // --- Activity: real tool calls, in plain English ---
+    const r1 = await preTool(srv.port, "s-act", cwd, "tu-1", "Bash", { command: "npm test", description: "run the unit tests" });
+    await settle();
+    const t2 = turnOf(c, "s-act");
+    check("24.3 a tool call shows as the session's current action, titled the same way as cards (Claude's own description)",
+      t2?.tools.length === 1 && t2.tools[0].title === "Run the unit tests" && t2.reportsActivity === true && !t2.tools[0].agentType,
+      JSON.stringify(t2));
+    const before = t2.lastActivity;
+    await postTool(srv.port, "s-act", cwd, "tu-1");
+    await settle();
+    const t3 = turnOf(c, "s-act");
+    check("24.4 when it finishes it's gone — no tool running, in a session that reports activity, is what the phone shows as \"Thinking…\"",
+      t3?.tools.length === 0 && t3.reportsActivity === true && t3.lastActivity > before,
+      JSON.stringify(t3));
+
+    // --- The hard rule: an activity hook's reply is always empty ---
+    const big = "x".repeat(2_500_000);
+    const replies = [
+      ["first PreToolUse", r1],
+      ["a destructive command", await preTool(srv.port, "s-act", cwd, "tu-2", "Bash", { command: "rm -rf /", description: "delete everything" })],
+      ["a file write", await preTool(srv.port, "s-act", cwd, "tu-3", "Write", { file_path: `${cwd}/a.ts`, content: "x" })],
+      ["a question", await preTool(srv.port, "s-act", cwd, "tu-4", "AskUserQuestion", { questions: [{ question: "Which?", options: [{ label: "A" }] }] })],
+      ["a body that looks like a decision", await activityHook(srv.port, "pre-tool-use", JSON.stringify({
+        session_id: "s-act", cwd, tool_name: "Bash", tool_input: { command: "git push" }, tool_use_id: "tu-5",
+        hookSpecificOutput: { permissionDecision: "allow" }, decision: { behavior: "allow" }, permission_decision: "allow" }))],
+      ["a subagent's call", await preTool(srv.port, "s-act", cwd, "tu-6", "Read", { file_path: `${cwd}/X.java` }, { agent_id: "ag-1", agent_type: "Explore" })],
+      ["an unknown session", await preTool(srv.port, "s-unknown", projectDir("never-seen"), "tu-7", "Bash", { command: "ls" })],
+      ["malformed JSON", await activityHook(srv.port, "pre-tool-use", "{not json")],
+      ["an empty body", await activityHook(srv.port, "pre-tool-use", "")],
+      ["a body over the size cap", await activityHook(srv.port, "pre-tool-use", JSON.stringify({ session_id: "s-act", cwd, tool_name: "Write", tool_input: { content: big }, tool_use_id: "tu-8" }))],
+      ["a PostToolUse", await postTool(srv.port, "s-act", cwd, "tu-2")],
+      ["a PostToolUse with a huge result", await postTool(srv.port, "s-act", cwd, "tu-3", { tool_response: { stdout: big } })],
+      ["a PostToolUseFailure", await postTool(srv.port, "s-act", cwd, "tu-4", { hook_event_name: "PostToolUseFailure", error: "failed" })],
+    ] as const;
+    const bad = replies.filter(([, r]) => r.status !== 200 || r.text !== "");
+    check("24.5 HARD RULE: every activity hook reply is 200 with an empty body — never a decision, whatever was sent",
+      bad.length === 0, bad.map(([what, r]) => `${what}: ${r.status} ${JSON.stringify(r.text.slice(0, 80))}`).join("; "));
+
+    // A permission request held open in the same session doesn't hold up activity replies.
+    const held = permissionHook(srv.port, "s-act", cwd, "git push origin main");
+    await c.toolUseIdFor("s-act", "git push origin main");
+    const during = await preTool(srv.port, "s-act", cwd, "tu-9", "Bash", { command: "ls" });
+    check("24.6 …and it comes straight back, even while a permission request in that session is waiting on you",
+      during.status === 200 && during.text === "" && during.ms < 1000, JSON.stringify(during));
+    const heldId = await c.toolUseIdFor("s-act", "git push origin main");
+    await c.request({ type: "decision", toolUseID: heldId, decision: "deny" });
+    await until(() => held.settled, 2000);
+
+    // --- Subagents, by name ---
+    await settle();
+    const t4 = turnOf(c, "s-act");
+    const sub = t4?.tools.find((x: any) => x.agentType === "Explore");
+    check("24.7 a subagent's tool call is shown under the subagent's name",
+      !!sub && sub.title === "Read X.java" && sub.agentId === "ag-1", JSON.stringify(t4?.tools));
+
+    // --- Batches: a new call from the same agent, well after its last, ends the earlier ones ---
+    await stopHook(srv.port, "s-act", cwd);
+    await userPromptSubmitHook(srv.port, "s-act", cwd, "next");
+    await preTool(srv.port, "s-act", cwd, "p-1", "Read", { file_path: `${cwd}/a.ts` });
+    await preTool(srv.port, "s-act", cwd, "p-2", "Read", { file_path: `${cwd}/b.ts` });
+    await settle();
+    const parallel = turnOf(c, "s-act")?.tools.length;
+    await sleep(1700);
+    await preTool(srv.port, "s-act", cwd, "p-3", "Edit", { file_path: `${cwd}/a.ts` });
+    await settle();
+    const afterBatch = turnOf(c, "s-act")?.tools.map((x: any) => x.title);
+    check("24.8 calls made together show together; a later call from the same agent means the earlier batch is over (even if a finish never came)",
+      parallel === 2 && JSON.stringify(afterBatch) === JSON.stringify(["Edit a.ts"]), `parallel=${parallel}; after=${JSON.stringify(afterBatch)}`);
+
+    // --- Bursts are throttled ---
+    const countBefore = c.events.filter((e) => e.type === "turns").length;
+    const burstStart = Date.now();
+    await Promise.all(Array.from({ length: 60 }, (_, i) => preTool(srv.port, "s-act", cwd, `b-${i}`, "Read", { file_path: `${cwd}/f${i}.ts` })));
+    await Promise.all(Array.from({ length: 60 }, (_, i) => postTool(srv.port, "s-act", cwd, `b-${i}`)));
+    const burstMs = Date.now() - burstStart;
+    await settle();
+    const sent = c.events.filter((e) => e.type === "turns").length - countBefore;
+    const finalTools = turnOf(c, "s-act")?.tools.map((x: any) => x.title);
+    check("24.9 a burst of 120 activity events reaches the phone as a handful of updates, ending in the true state",
+      sent <= Math.ceil(burstMs / 400) + 2 && JSON.stringify(finalTools) === JSON.stringify(["Edit a.ts"]),
+      `updates=${sent} over ${burstMs}ms; final=${JSON.stringify(finalTools)}`);
+
+    // --- Live only: never history, never a chat message ---
+    const db = new Database(srv.dbPath, { readonly: true });
+    const stored = db.prepare(`SELECT COUNT(*) n FROM messages WHERE content LIKE '%X.java%' OR content LIKE '%unit tests%' OR content LIKE '%f12.ts%'`).get() as { n: number };
+    db.close();
+    const chatty = c.events.filter((e) => typeof e.content === "string" && /X\.java|f12\.ts|unit tests/.test(e.content));
+    check("24.10 activity is never stored in history (so never in search) and never sent as a chat message or push",
+      stored.n === 0 && chatty.length === 0, `stored=${stored.n}; messages=${JSON.stringify(chatty).slice(0, 200)}`);
+
+    // --- A turn's end clears it ---
+    await stopHook(srv.port, "s-act", cwd);
+    await settle();
+    check("24.11 when the turn ends the session leaves the indicator, tools and all",
+      !turnOf(c, "s-act"), JSON.stringify(turnOf(c, "s-act")));
+
+    // --- A subagent can't make an idle session look busy ---
+    await preTool(srv.port, "s-act", cwd, "late-1", "Read", { file_path: `${cwd}/c.ts` }, { agent_id: "ag-bg", agent_type: "general-purpose" });
+    await settle();
+    const idleTurn = turnOf(c, "s-act");
+    resetClaudeLog();
+    const ack = await c.request({ type: "chat", content: "carry on", replyToSession: { sessionId: "s-act", changedMsAgo: 5000 } });
+    check("24.12 a background subagent still working after the turn ended doesn't mark the session busy — your message goes straight in",
+      !idleTurn && ack?.action === "instructed", `turn=${JSON.stringify(idleTurn)}; ${describeAck(ack)}`);
+    await stopHook(srv.port, "s-act", cwd);
+
+    // --- A session first seen through activity is filed under its project ---
+    await settle();
+    const unknown = c.latest((e) => e.type === "turns")?.sessions.find((x: any) => x.sessionId === "s-unknown");
+    check("24.13 a turn first seen through a tool call is filed under its project, like one seen through any other hook",
+      unknown?.projectKey === projectDir("never-seen") && unknown.tools.length === 1, JSON.stringify(unknown));
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+
+  // --- watch-project installs the activity hooks, observe-only and short ---
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-act-")));
+  try {
+    const repo = mkRepo(path.join(root, "svc"));
+    const dbPath = path.join(root, "scratch.db");
+    const port = await freePort();
+    runWatchProject([repo], dbPath, port);
+    runWatchProject([repo], dbPath, port); // a re-run adds nothing twice
+    const hooks = JSON.parse(fs.readFileSync(path.join(repo, ".claude", "settings.local.json"), "utf8")).hooks;
+    const one = (event: string, url: string, timeout: number) => {
+      const entries = (hooks[event] ?? []).flatMap((e: any) => e.hooks).filter((h: any) => h.url === `http://localhost:${port}/api/hooks/${url}`);
+      return entries.length === 1 && entries[0].timeout === timeout && entries[0].type === "http";
+    };
+    check("24.14 watch-project adds PreToolUse, PostToolUse and PostToolUseFailure hooks with a 3-second timeout, once each — the others unchanged",
+      one("PreToolUse", "pre-tool-use", 3) && one("PostToolUse", "post-tool-use", 3) && one("PostToolUseFailure", "post-tool-use", 3) &&
+        one("Stop", "stop", 30) && one("PermissionRequest", "permission-request", 604800),
+      JSON.stringify(hooks));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const pushPort = await startPushEndpoint();
   const scenarios: [string, () => Promise<void>][] = [
@@ -2095,6 +2387,8 @@ async function main() {
     ["20. Search across history", scenarioSearch],
     ["21. Editing and removing queued messages", scenarioEditQueued],
     ["22. Summarize a change and send it to a colleague (Google Chat stand-in)", scenarioChatSummary],
+    ["23. Project names by contains-match", scenarioContainsOpen],
+    ["24. Working indicator; activity hooks only ever observe", scenarioActivity],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;

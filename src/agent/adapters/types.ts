@@ -13,6 +13,11 @@ import type { RequestSummary } from "../describe.js";
 // the agent must be able to hold a tool call open until you answer, with no
 // time limit and no default action. An agent that can't is observe-only, or
 // isn't supported.
+//
+// Reporting live activity (which tool is running) is optional. An agent that
+// doesn't report it gets the working indicator's timer without the action
+// line. Activity is observe-only, always: whatever carries it must never be
+// able to answer for you — see "Observe-only hooks" in ARCHITECTURE.md.
 
 // What you decided on a held request, in Jarvis's own terms. Each adapter
 // turns it into whatever its agent expects back.
@@ -21,12 +26,16 @@ export type Decision =
   | { behavior: "deny"; message: string; interrupt?: boolean };
 
 // One event reported by an agent (session start, prompt submitted,
-// permission request, turn end), in Jarvis's own terms.
+// permission request, tool activity, turn end), in Jarvis's own terms.
 export interface AgentEvent {
   sessionId: string;
   cwd: string;
   toolName?: string;
   toolInput?: Record<string, unknown>;
+  // Activity events: the agent's own ID for the tool call (pairs a start
+  // with its finish), and the subagent that made it, if one did.
+  toolUseId?: string;
+  subagent?: { id: string; type: string };
   // Where the agent keeps the session's transcript, if it has one; stored
   // as sessions.transcript_path and only ever read back by the same adapter.
   transcriptRef?: string | null;
