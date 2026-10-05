@@ -137,6 +137,41 @@ export function loadPlanUsage(): unknown {
   return row ? JSON.parse(row.data) : undefined;
 }
 
+// Messages waiting for a busy session (agent/router.ts keeps the queue in
+// memory and mirrors it here on every change), so a restart can still send
+// them.
+db.exec(`CREATE TABLE IF NOT EXISTS queued_messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  project_tag TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  message_id INTEGER
+)`);
+
+export interface QueuedRow {
+  id: string;
+  session_id: string;
+  project_tag: string;
+  text: string;
+  at: number;
+  message_id: number | null;
+}
+
+export const saveQueue = db.transaction((rows: QueuedRow[]) => {
+  db.prepare(`DELETE FROM queued_messages`).run();
+  const insert = db.prepare(
+    `INSERT INTO queued_messages (id, session_id, project_tag, text, at, message_id) VALUES (@id, @session_id, @project_tag, @text, @at, @message_id)`,
+  );
+  for (const row of rows) insert.run(row);
+});
+
+export function takeQueue(): QueuedRow[] {
+  const rows = db.prepare(`SELECT * FROM queued_messages ORDER BY at`).all() as QueuedRow[];
+  db.prepare(`DELETE FROM queued_messages`).run();
+  return rows;
+}
+
 // Which agent runs each session and project (agent/adapters). Everything
 // stored before adapters existed was Claude Code, which the default records.
 for (const table of ["sessions", "projects"]) {

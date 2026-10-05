@@ -199,7 +199,10 @@ export function attachWebSocketServer(
     // permission request (cards read their state from it). Message history
     // is per project, fetched by the client for the project it's showing.
     ws.send(JSON.stringify(permissionsSnapshot()));
-    for (const snapshot of connectSnapshots) ws.send(JSON.stringify(snapshot()));
+    for (const snapshot of connectSnapshots) {
+      const payload = snapshot();
+      if (payload !== undefined) ws.send(JSON.stringify(payload)); // undefined: nothing to say right now
+    }
 
     const reply: Reply = (payload) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));

@@ -447,13 +447,17 @@ function appendMessage({ id, direction, type, content, tag, projectTag, toolUseI
     else buildPermissionCard(div, toolUseID);
   }
   if (choiceId && Array.isArray(choices)) buildChoiceButtons(div, choiceId, choices);
+  // Tapping a message points the reply target at its session. An incoming
+  // message never moves it: the target changes only by something you do
+  // (this tap, opening a project, or ✕).
   if (sessionId && projectTag) {
     div.classList.add("targetable");
+    div.dataset.sessionId = sessionId;
+    div.dataset.projectTag = projectTag;
     div.addEventListener("click", (e) => {
       if (e.target.closest(".perm-actions")) return; // an Approve/Deny tap isn't a retarget
       setReplyTarget(sessionId, projectTag);
     });
-    setReplyTarget(sessionId, projectTag);
   }
   container.appendChild(div);
   if (div.classList.contains("mine")) renderMessageState(div);
@@ -977,9 +981,18 @@ async function openProject(key, block, focusMessageId) {
   if (currentProject !== key) return; // switched away while loading
   messagesEl.replaceChildren();
   permissionCards.clear();
-  replyTarget = null;
   for (const m of messages) appendMessage({ ...m, tag: m.projectTag });
-  if (!viewingLive) replyTarget = null; // an old block isn't where a reply goes
+  // Opening a project is choosing it: the target becomes its latest session.
+  // Reopening the same view (a refresh, a reconnect) keeps a session you
+  // tapped in it; an old block from History is never where a reply goes.
+  const sessionsHere = [...messagesEl.querySelectorAll(".msg[data-session-id]")];
+  const kept = replyTarget && sessionsHere.some((el) => el.dataset.sessionId === replyTarget.sessionId);
+  if (!viewingLive) replyTarget = null;
+  else if (!kept) {
+    const last = sessionsHere.at(-1);
+    replyTarget = null;
+    if (last) setReplyTarget(last.dataset.sessionId, last.dataset.projectTag);
+  }
   renderReplyTarget();
   renderViewingBar(viewingLive ? latest : block, viewingLive);
   if (viewingLive) for (const d of drafts.values()) if (d.projectKey === key) renderDraft(d);

@@ -55,7 +55,10 @@ async function until<T>(fn: () => T | undefined | false, timeoutMs: number): Pro
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
-    srv.listen(0, () => {
+    // On 127.0.0.1 specifically: "localhost" reaches IPv4 first, and another
+    // app (VS Code has) can hold 127.0.0.1:<port> while the dual-stack port
+    // looks free — its server then answers our health check.
+    srv.listen(0, "127.0.0.1", () => {
       const { port } = srv.address() as net.AddressInfo;
       srv.close(() => resolve(port));
     });
@@ -180,6 +183,7 @@ async function startServer(opts: { port?: number; dbPath?: string; env?: Record<
     if (proc.exitCode !== null) break;
     await sleep(100);
   }
+  proc.kill(); // don't leave it running
   throw new Error(`server failed to start:\n${output.join("")}`);
 }
 
@@ -1418,6 +1422,80 @@ async function scenarioInterruptingDeny() {
     await sleep(2200);
     check("28.5 if a Stop and a new turn arrive before Jarvis steps in, the new turn isn't ended by mistake",
       !!turnOf(), JSON.stringify(turnOf()));
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
+async function scenarioQueueSurvivesRestart() {
+  resetClaudeLog();
+  const dbPath = path.join(TMP, `jarvis-queue-${crypto.randomUUID()}.db`);
+  const env = { BUSY_NUDGE_MS: "1500" };
+  let srv = await startServer({ dbPath, env });
+  try {
+    let c = await Client.open(srv.port, await login(srv.port));
+    const cwd = fs.realpathSync(projectDir("s29", "auth-svc"));
+    const to = { sessionId: "s29-auth", changedMsAgo: 5000 };
+    const restart = async () => {
+      c.close();
+      await killServer(srv);
+      srv = await startServer({ dbPath, env });
+      c = await Client.open(srv.port, await login(srv.port));
+    };
+    const queueFor = () => c.latest((e) => e.type === "queue")?.sessions?.find((s: any) => s.sessionId === "s29-auth");
+
+    // --- (a) The turn is still running when the server restarts ---
+    await stopHook(srv.port, "s29-auth", cwd);
+    await userPromptSubmitHook(srv.port, "s29-auth", cwd, "audit the logging");
+    resetClaudeLog();
+    const a1 = await c.request({ type: "chat", content: "then look at the kong headers", replyToSession: to });
+    const a2 = await c.request({ type: "chat", content: "and summarise", replyToSession: to });
+    check("29.1 two messages wait for the busy session", a1?.action === "queued" && a2?.action === "queued", `${describeAck(a1)}; ${describeAck(a2)}`);
+
+    await restart();
+    await sleep(1000);
+    const note = await c.waitFor((e) => e.tag === "jarvis" && String(e.content).startsWith("Jarvis restarted with 2 messages waiting"), 1500);
+    check("29.2 after a restart nothing is sent into a turn that may still be running — the messages are still queued, and you're told",
+      claudeInvocations().length === 0 && queueFor()?.items?.map((i: any) => i.text).join("|") === "then look at the kong headers|and summarise" &&
+        !!note && String(note.content).includes('say "send now auth-svc"'),
+      `claude invoked: ${JSON.stringify(claudeInvocations())}; queue=${JSON.stringify(queueFor())}; note=${JSON.stringify(note)}`);
+
+    await stopHook(srv.port, "s29-auth", cwd); // that turn's Stop reaches the restarted server
+    await until(() => claudeInvocations().length > 0, 3000);
+    const inv = claudeInvocations();
+    check("29.3 when that turn's Stop arrives, they go in, in order, as one resumed turn",
+      inv.length === 1 && inv[0].startsWith(`cwd=${cwd} `) && inv[0].includes("--resume s29-auth") &&
+        inv[0].indexOf("then look at the kong headers") < inv[0].indexOf("and summarise"),
+      `claude invoked: ${JSON.stringify(inv)}`);
+    await stopHook(srv.port, "s29-auth", cwd); // the delivered turn ends
+
+    // --- (b) The turn ended while the server was down: its Stop went nowhere ---
+    await userPromptSubmitHook(srv.port, "s29-auth", cwd, "fix the tests");
+    resetClaudeLog();
+    const a3 = await c.request({ type: "chat", content: "and update the README", replyToSession: to });
+    check("29.4 a message waits for the next busy turn", a3?.action === "queued", describeAck(a3));
+    await killServer(srv); // down…
+    // …the turn finishes now; its Stop has no server to reach.
+    srv = await startServer({ dbPath, env });
+    c.close();
+    c = await Client.open(srv.port, await login(srv.port));
+    const nudge = await c.waitFor((e) => e.tag === "jarvis" && String(e.content).includes('Say "send now auth-svc"'), 8000); // checked every 5s
+    check("29.5 with no Stop coming, nothing is sent on its own — the quiet-session nudge says how to send it",
+      claudeInvocations().length === 0 && !!nudge, `claude invoked: ${JSON.stringify(claudeInvocations())}; nudge=${JSON.stringify(nudge)}`);
+
+    const a4 = await c.request({ type: "chat", content: "send now auth-svc" });
+    await until(() => claudeInvocations().length > 0, 3000);
+    const inv2 = claudeInvocations();
+    check("29.6 'send now' delivers it",
+      a4?.action === "sent_now" && inv2.length === 1 && inv2[0].includes("--resume s29-auth") && inv2[0].includes("and update the README"),
+      `claude invoked: ${JSON.stringify(inv2)}; ${describeAck(a4)}`);
+
+    resetClaudeLog();
+    await restart();
+    await sleep(1500);
+    check("29.7 sent messages are gone for good — the next restart restores nothing and sends nothing",
+      claudeInvocations().length === 0 && !queueFor(), `claude invoked: ${JSON.stringify(claudeInvocations())}; queue=${JSON.stringify(queueFor())}`);
     c.close();
   } finally {
     await killServer(srv);
@@ -2726,6 +2804,7 @@ async function main() {
     ["26. Plan usage from the status line", scenarioPlanUsage],
     ["27. Talking to Jarvis", scenarioJarvisChat],
     ["28. Deny ends the turn", scenarioInterruptingDeny],
+    ["29. Queued messages survive a restart", scenarioQueueSurvivesRestart],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;

@@ -14,7 +14,7 @@ import { serveStatic } from "./staticServer.js";
 import { attachWebSocketServer } from "./wsServer.js";
 import { broadcastPush } from "./push.js";
 import { resolvePermission } from "./agent/permissions.js";
-import { handleInbound } from "./agent/router.js";
+import { handleInbound, restoreQueueLeftByRestart } from "./agent/router.js";
 import { listProjectHistories, projectBlocks, projectMessages } from "./agent/history.js";
 import { searchHistory } from "./agent/search.js";
 import { handleSessionStart, handleUserPromptSubmit, handlePermissionRequest, handleStop, handleToolStart, handleToolEnd } from "./hooks/routes.js";
@@ -322,4 +322,5 @@ attachWebSocketServer(server, handleInbound);
 
 server.listen(config.port, () => {
   console.log(`JARVIS listening on http://localhost:${config.port}`);
+  restoreQueueLeftByRestart();
 });

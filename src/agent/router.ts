@@ -17,6 +17,8 @@ import {
   deleteMessage,
   getPermission,
   hasRecentDeadPermission,
+  saveQueue,
+  takeQueue,
 } from "../db.js";
 import { resolvePermission, listPendingPermissions } from "./permissions.js";
 import { validateAnswers, answersFromText, describeAnswers } from "./questions.js";
@@ -154,8 +156,58 @@ function queueSnapshot() {
   };
 }
 
+// Every change to the queue comes through here, so this is also where it's
+// mirrored to the database for restoreQueueLeftByRestart.
 function broadcastQueue(): void {
+  saveQueue(
+    [...busy.entries()].flatMap(([sessionId, e]) =>
+      e.queued.map((q) => ({ id: q.id, session_id: sessionId, project_tag: e.tag, text: q.text, at: q.at, message_id: q.messageId ?? null })),
+    ),
+  );
   broadcast(queueSnapshot());
+}
+
+// At startup: messages that were waiting when the server stopped. A message
+// is only ever queued because its session was mid-turn, so that's what it
+// still is — busy state is in memory and a restart loses it, but the queue
+// is evidence of it. The session goes back to busy with its messages queued,
+// and they go in on its Stop, exactly as if nothing had restarted; nothing
+// is ever sent into a turn that may still be running. A turn that ended
+// while the server was down sent its Stop to nobody: the usual quiet-session
+// nudge then says so, and "send now" delivers. Nobody is connected yet, so
+// the note about it is shown to whoever connects in the next RESTART_NOTE_MS.
+const RESTART_NOTE_MS = 2 * 60_000;
+let restartNote: { text: string; until: number } | undefined;
+registerConnectSnapshot(() =>
+  restartNote && Date.now() < restartNote.until ? { direction: "out", type: "chat", content: restartNote.text, tag: "jarvis" } : undefined,
+);
+
+export function restoreQueueLeftByRestart(): void {
+  const bySession = new Map<string, { tag: string; items: QueuedItem[] }>();
+  for (const row of takeQueue()) {
+    const entry = bySession.get(row.session_id) ?? { tag: row.project_tag, items: [] };
+    entry.items.push({ id: row.id, text: row.text, at: row.at, messageId: row.message_id ?? undefined });
+    bySession.set(row.session_id, entry);
+  }
+  const notes: string[] = [];
+  for (const [sessionId, { tag, items }] of bySession) {
+    const n = `${items.length} message${items.length > 1 ? "s" : ""}`;
+    if (!getSession(sessionId)?.cwd) {
+      notes.push(`Jarvis restarted with ${n} waiting for "${tag}", but that session is gone, so nothing was sent: ${items.map((q) => `"${q.text}"`).join(", ")}.`);
+      continue;
+    }
+    markBusy(sessionId, tag, "turn");
+    busy.get(sessionId)!.queued.push(...items);
+    notes.push(
+      `Jarvis restarted with ${n} waiting for "${tag}". ${items.length > 1 ? "They go" : "It goes"} in when its current turn ends — ` +
+        `if that turn already ended while I was down, say "send now ${tag}".`,
+    );
+  }
+  broadcastQueue(); // saves the restored queue again
+  if (notes.length) {
+    restartNote = { text: notes.join("\n"), until: Date.now() + RESTART_NOTE_MS };
+    console.log(restartNote.text);
+  }
 }
 registerConnectSnapshot(queueSnapshot);
 
