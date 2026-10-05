@@ -110,3 +110,39 @@ export function searchHistory(text: string, projectKey?: string): { results: Sea
     .slice(0, MAX_RESULTS);
   return { results, partial };
 }
+
+// Projects whose history is about what a message is about, for suggesting
+// where an unrouted sentence belongs ("back to the identity RBAC work").
+// Only the message's distinctive words count: ones that turn up in the
+// history of at most MAX_PROJECTS_PER_WORD projects (and not every project
+// with history), like "rbac" or "kong" — never "back", "the" or "work",
+// which every project has. How often a word appears doesn't matter: the
+// topic you're deep in is the one you mention most. Best match first. These
+// are suggestions: the caller always asks before acting on them.
+const MAX_PROJECTS_PER_WORD = 2;
+const STOP_WORDS = new Set(
+  ("the and for with that this from into onto back lets let's look check please can could would should will just about " +
+    "again then than what when where which while work working thing stuff project repo some more need want " +
+    "run fix add update make test tests build show tell see get use try start open close change done").split(" "),
+);
+
+export function projectsDiscussing(text: string): string[] {
+  const projectsIn = db.prepare(
+    `SELECT count(DISTINCT s.project_tag) AS n
+       FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid JOIN sessions s ON s.id = m.session_id
+      WHERE messages_fts MATCH ? AND s.cwd IS NOT NULL`,
+  );
+  const withHistory = (db
+    .prepare(`SELECT count(DISTINCT s.project_tag) AS n FROM messages m JOIN sessions s ON s.id = m.session_id WHERE s.cwd IS NOT NULL`)
+    .get() as { n: number }).n;
+  const distinctive = [...new Set(words(text))].filter((w) => {
+    if (w.length < 3 || STOP_WORDS.has(w)) return false;
+    const n = (projectsIn.get(`"${w}"`) as { n: number }).n;
+    return n > 0 && n <= MAX_PROJECTS_PER_WORD && n < withHistory;
+  });
+  if (!distinctive.length) return [];
+  const quoted = distinctive.map((w) => `"${w}"`);
+  let found = hits(quoted.join(" "));
+  if (!found.length && distinctive.length > 1) found = hits(quoted.join(" OR "));
+  return [...new Set(found.map((h) => h.projectTag))];
+}

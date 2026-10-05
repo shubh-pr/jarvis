@@ -1091,6 +1091,106 @@ async function scenarioContainsOpen() {
   }
 }
 
+async function scenarioSentenceRouting() {
+  resetClaudeLog();
+  const srv = await startServer();
+  try {
+    const token = await login(srv.port);
+    const c = await Client.open(srv.port, token);
+    const dir = (name: string) => fs.realpathSync(projectDir("s25", name));
+    const cwd = {
+      auth: dir("auth-central"), identity: dir("identity"), comms: dir("communication"),
+      kafka: dir("kafka-suite"), zeta: dir("zeta"), identica: dir("Identica-360"), hrms: dir("hrms-ui-code"),
+    };
+    registerProjectDirect(srv.dbPath, "auth-central", cwd.auth);
+    registerProjectDirect(srv.dbPath, "identity", cwd.identity);
+    registerProjectDirect(srv.dbPath, "communication", cwd.comms);
+    registerProjectDirect(srv.dbPath, "kafka-suite", cwd.kafka);
+    registerProjectDirect(srv.dbPath, "zeta", cwd.zeta);
+    registerProjectDirect(srv.dbPath, "Identica-360", cwd.identica);
+    registerProjectDirect(srv.dbPath, "hrms-ui-code", cwd.hrms);
+
+    // History in five projects, then those sessions end. "rbac" is in two
+    // projects' history, "kong" in one; "tests" and "logs" are in three, so
+    // they say nothing about which project is meant.
+    const seed: [string, string, string[]][] = [
+      ["h-auth", cwd.auth, ["add RBAC checks to the Kong plugin", "validate token headers coming from Kong"]],
+      ["h-identity", cwd.identity, ["RBAC roles for identity users"]],
+      ["h-kafka", cwd.kafka, ["run the tests for the consumer", "check the logs"]],
+      ["h-zeta", cwd.zeta, ["run the tests again", "tail the logs"]],
+      ["h-comms", cwd.comms, ["send the welcome emails", "fix the tests and the logs"]],
+    ];
+    for (const [id, dirPath, prompts] of seed) {
+      await sessionStartHook(srv.port, id, dirPath);
+      for (const prompt of prompts) await userPromptSubmitHook(srv.port, id, dirPath, prompt);
+      markSessionDone(srv.dbPath, id);
+    }
+    // Two projects running and no reply target: free text reaches no session.
+    await sessionStartHook(srv.port, "live-zeta", cwd.zeta);
+    await sessionStartHook(srv.port, "live-kafka", cwd.kafka);
+    resetClaudeLog();
+    const tagsOf = (ack: any) => (ack?.choices ?? []).map((ch: any) => ch.tag).sort().join(",");
+    const said = () => c.latest((e) => e.tag === "jarvis" && e.type === "chat")?.content ?? "";
+
+    const ack1 = await c.request({ type: "chat", content: "what was that kong thing" });
+    check("25.1 a sentence naming no project gets the projects its distinctive words point to in history — and even one strong candidate waits for a tap",
+      ack1?.reason === "ambiguous" && tagsOf(ack1) === "auth-central" && typeof ack1?.choiceId === "string" &&
+        said().startsWith("Did you mean auth-central?") && claudeInvocations().length === 0,
+      `${describeAck(ack1)}; said=${JSON.stringify(said())}; claude invoked: ${JSON.stringify(claudeInvocations())}`);
+
+    const ack2 = await c.request({ type: "chat", content: "yes", openChoice: ack1?.choiceId });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv2 = claudeInvocations();
+    check("25.2 'yes' to a one-project picker opens it, with the whole sentence as the instruction",
+      ack2?.action === "launching" && inv2.length === 1 && inv2[0].startsWith(`cwd=${cwd.auth} `) && inv2[0].includes("what was that kong thing"),
+      `claude invoked: ${JSON.stringify(inv2)}; ${describeAck(ack2)}`);
+
+    resetClaudeLog();
+    const ack3 = await c.request({ type: "chat", content: "back to the identity RBAC work" });
+    check("25.3 a project named only by a plain word ('identity') isn't acted on — it's offered with what history suggests, as a picker",
+      ack3?.reason === "ambiguous" && tagsOf(ack3) === "auth-central,identity" && claudeInvocations().length === 0,
+      `${describeAck(ack3)}; said=${JSON.stringify(said())}`);
+
+    const ack4 = await c.request({ type: "chat", content: "no", openChoice: ack3?.choiceId });
+    const ack4b = await c.request({ type: "chat", content: "1", openChoice: ack3?.choiceId });
+    check("25.4 'no' dismisses the picker: nothing opened or sent, and the list can't be answered afterwards",
+      ack4?.ok === true && ack4?.action === "choice_dismissed" && ack4b?.reason === "stale" && claudeInvocations().length === 0,
+      `${describeAck(ack4)}; then ${describeAck(ack4b)}`);
+
+    const ack5 = await c.request({ type: "chat", content: "improve communication between the services" });
+    check("25.5 a tag that's an ordinary word ('communication') in a sentence only ever gets a picker, never an action",
+      ack5?.reason === "ambiguous" && tagsOf(ack5) === "communication" && claudeInvocations().length === 0,
+      `${describeAck(ack5)}; said=${JSON.stringify(said())}`);
+
+    const ack6 = await c.request({ type: "chat", content: "let's look at auth-central and the token flow" });
+    check("25.6 a sentence naming one project by a tag that can't be an ordinary word goes there, as 'open' would",
+      ack6?.ok === true && ack6?.projectKey === cwd.auth, describeAck(ack6));
+
+    // (Neither is running: a running project named in a message already
+    // routes there, before any of this.)
+    resetClaudeLog();
+    const ack7 = await c.request({ type: "chat", content: "compare Identica-360 with hrms-ui-code" });
+    check("25.7 a sentence naming two projects gets the picker",
+      ack7?.reason === "ambiguous" && tagsOf(ack7) === "Identica-360,hrms-ui-code" && claudeInvocations().length === 0,
+      describeAck(ack7));
+
+    const ack8 = await c.request({ type: "chat", content: "run the tests and check the logs" });
+    check("25.8 a sentence with nothing distinctive keeps today's 'Which project?' refusal",
+      ack8?.reason === "unroutable" && said().startsWith("Which project? Active:") && claudeInvocations().length === 0,
+      `${describeAck(ack8)}; said=${JSON.stringify(said())}`);
+
+    const ack9 = await c.request({ type: "chat", content: "back to the identity RBAC work", replyToSession: { sessionId: "live-zeta", changedMsAgo: 5000 } });
+    await until(() => claudeInvocations().length > 0, 2000);
+    const inv9 = claudeInvocations();
+    check("25.9 with a reply target, the sentence goes to the target as before — it's never matched against projects",
+      inv9.length === 1 && inv9[0].includes("--resume live-zeta"), `claude invoked: ${JSON.stringify(inv9)}; ${describeAck(ack9)}`);
+
+    c.close();
+  } finally {
+    await killServer(srv);
+  }
+}
+
 function readPermissions(repo: string): { allow: string[]; ask: string[] } | undefined {
   const f = path.join(repo, ".claude", "settings.local.json");
   if (!fs.existsSync(f)) return undefined;
@@ -2389,6 +2489,7 @@ async function main() {
     ["22. Summarize a change and send it to a colleague (Google Chat stand-in)", scenarioChatSummary],
     ["23. Project names by contains-match", scenarioContainsOpen],
     ["24. Working indicator; activity hooks only ever observe", scenarioActivity],
+    ["25. Sentences resolve to a project without guessing", scenarioSentenceRouting],
   ];
   for (const [title, run] of scenarios) {
     currentScenario = title;
